@@ -25,10 +25,12 @@ class TestFirecrawlClientConfig:
             "FIRECRAWL_API_KEY",
             "FIRECRAWL_API_URL",
             "TOOL_GATEWAY_URL",
+            "FIRECRAWL_GATEWAY_URL",
+            "TOOL_GATEWAY_DOMAIN",
+            "TOOL_GATEWAY_SCHEME",
             "TOOL_GATEWAY_USER_TOKEN",
         ):
             os.environ.pop(key, None)
-        os.environ["TOOL_GATEWAY_URL"] = ""
 
     def teardown_method(self):
         """Reset client after each test."""
@@ -39,6 +41,9 @@ class TestFirecrawlClientConfig:
             "FIRECRAWL_API_KEY",
             "FIRECRAWL_API_URL",
             "TOOL_GATEWAY_URL",
+            "FIRECRAWL_GATEWAY_URL",
+            "TOOL_GATEWAY_DOMAIN",
+            "TOOL_GATEWAY_SCHEME",
             "TOOL_GATEWAY_USER_TOKEN",
         ):
             os.environ.pop(key, None)
@@ -80,12 +85,13 @@ class TestFirecrawlClientConfig:
     def test_no_config_raises_with_helpful_message(self):
         """Neither key nor URL → ValueError with guidance."""
         with patch("tools.web_tools.Firecrawl"):
-            from tools.web_tools import _get_firecrawl_client
-            with pytest.raises(ValueError, match="FIRECRAWL_API_KEY"):
-                _get_firecrawl_client()
+            with patch("tools.web_tools._read_nous_access_token", return_value=None):
+                from tools.web_tools import _get_firecrawl_client
+                with pytest.raises(ValueError, match="FIRECRAWL_API_KEY"):
+                    _get_firecrawl_client()
 
-    def test_tool_gateway_mode_with_nous_token(self):
-        """Gateway mode is used when direct Firecrawl is not configured."""
+    def test_legacy_tool_gateway_mode_with_nous_token(self):
+        """Legacy TOOL_GATEWAY_URL mode still routes through the shared proxy."""
         with patch.dict(os.environ, {"TOOL_GATEWAY_URL": "https://gateway.example/"}):
             with patch("tools.web_tools._read_nous_access_token", return_value="nous-token"):
                 with patch("tools.web_tools.Firecrawl") as mock_fc:
@@ -97,11 +103,77 @@ class TestFirecrawlClientConfig:
                     )
                     assert result is mock_fc.return_value
 
+    def test_tool_gateway_domain_builds_firecrawl_gateway_origin(self):
+        """Shared gateway domain should derive the Firecrawl vendor hostname."""
+        with patch.dict(os.environ, {"TOOL_GATEWAY_DOMAIN": "rewbs.uk"}):
+            with patch("tools.web_tools._read_nous_access_token", return_value="nous-token"):
+                with patch("tools.web_tools.Firecrawl") as mock_fc:
+                    from tools.web_tools import _get_firecrawl_client
+                    result = _get_firecrawl_client()
+                    mock_fc.assert_called_once_with(
+                        api_key="nous-token",
+                        api_url="https://firecrawl-gateway.rewbs.uk",
+                    )
+                    assert result is mock_fc.return_value
+
+    def test_tool_gateway_scheme_can_switch_derived_gateway_origin_to_http(self):
+        """Shared gateway scheme should allow local plain-http vendor hosts."""
+        with patch.dict(os.environ, {
+            "TOOL_GATEWAY_DOMAIN": "rewbs.uk",
+            "TOOL_GATEWAY_SCHEME": "http",
+        }):
+            with patch("tools.web_tools._read_nous_access_token", return_value="nous-token"):
+                with patch("tools.web_tools.Firecrawl") as mock_fc:
+                    from tools.web_tools import _get_firecrawl_client
+                    result = _get_firecrawl_client()
+                    mock_fc.assert_called_once_with(
+                        api_key="nous-token",
+                        api_url="http://firecrawl-gateway.rewbs.uk",
+                    )
+                    assert result is mock_fc.return_value
+
+    def test_invalid_tool_gateway_scheme_raises(self):
+        """Unexpected shared gateway schemes should fail fast."""
+        with patch.dict(os.environ, {
+            "TOOL_GATEWAY_DOMAIN": "rewbs.uk",
+            "TOOL_GATEWAY_SCHEME": "ftp",
+        }):
+            with patch("tools.web_tools._read_nous_access_token", return_value="nous-token"):
+                from tools.web_tools import _get_firecrawl_client
+                with pytest.raises(ValueError, match="TOOL_GATEWAY_SCHEME"):
+                    _get_firecrawl_client()
+
+    def test_explicit_firecrawl_gateway_url_takes_precedence(self):
+        """An explicit Firecrawl gateway origin should override the shared domain."""
+        with patch.dict(os.environ, {
+            "FIRECRAWL_GATEWAY_URL": "https://firecrawl-gateway.localhost:3009/",
+            "TOOL_GATEWAY_DOMAIN": "rewbs.uk",
+        }):
+            with patch("tools.web_tools._read_nous_access_token", return_value="nous-token"):
+                with patch("tools.web_tools.Firecrawl") as mock_fc:
+                    from tools.web_tools import _get_firecrawl_client
+                    _get_firecrawl_client()
+                    mock_fc.assert_called_once_with(
+                        api_key="nous-token",
+                        api_url="https://firecrawl-gateway.localhost:3009",
+                    )
+
+    def test_default_gateway_domain_targets_nous_production_origin(self):
+        """Default gateway origin should point at the Firecrawl vendor hostname."""
+        with patch("tools.web_tools._read_nous_access_token", return_value="nous-token"):
+            with patch("tools.web_tools.Firecrawl") as mock_fc:
+                from tools.web_tools import _get_firecrawl_client
+                _get_firecrawl_client()
+                mock_fc.assert_called_once_with(
+                    api_key="nous-token",
+                    api_url="https://firecrawl-gateway.nousresearch.com",
+                )
+
     def test_direct_mode_is_preferred_over_tool_gateway(self):
         """Explicit Firecrawl config should win over the gateway fallback."""
         with patch.dict(os.environ, {
             "FIRECRAWL_API_KEY": "fc-test",
-            "TOOL_GATEWAY_URL": "https://gateway.example",
+            "TOOL_GATEWAY_DOMAIN": "rewbs.uk",
         }):
             with patch("tools.web_tools._read_nous_access_token", return_value="nous-token"):
                 with patch("tools.web_tools.Firecrawl") as mock_fc:
@@ -155,9 +227,10 @@ class TestFirecrawlClientConfig:
         """FIRECRAWL_API_KEY='' with no URL → should raise."""
         with patch.dict(os.environ, {"FIRECRAWL_API_KEY": ""}):
             with patch("tools.web_tools.Firecrawl"):
-                from tools.web_tools import _get_firecrawl_client
-                with pytest.raises(ValueError):
-                    _get_firecrawl_client()
+                with patch("tools.web_tools._read_nous_access_token", return_value=None):
+                    from tools.web_tools import _get_firecrawl_client
+                    with pytest.raises(ValueError):
+                        _get_firecrawl_client()
 
 
 class TestBackendSelection:
@@ -168,7 +241,17 @@ class TestBackendSelection:
     setups.
     """
 
-    _ENV_KEYS = ("PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL", "TAVILY_API_KEY")
+    _ENV_KEYS = (
+        "PARALLEL_API_KEY",
+        "FIRECRAWL_API_KEY",
+        "FIRECRAWL_API_URL",
+        "TOOL_GATEWAY_URL",
+        "FIRECRAWL_GATEWAY_URL",
+        "TOOL_GATEWAY_DOMAIN",
+        "TOOL_GATEWAY_SCHEME",
+        "TOOL_GATEWAY_USER_TOKEN",
+        "TAVILY_API_KEY",
+    )
 
     def setup_method(self):
         for key in self._ENV_KEYS:
@@ -317,7 +400,17 @@ class TestParallelClientConfig:
 class TestCheckWebApiKey:
     """Test suite for check_web_api_key() unified availability check."""
 
-    _ENV_KEYS = ("PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL", "TAVILY_API_KEY")
+    _ENV_KEYS = (
+        "PARALLEL_API_KEY",
+        "FIRECRAWL_API_KEY",
+        "FIRECRAWL_API_URL",
+        "TOOL_GATEWAY_URL",
+        "FIRECRAWL_GATEWAY_URL",
+        "TOOL_GATEWAY_DOMAIN",
+        "TOOL_GATEWAY_SCHEME",
+        "TOOL_GATEWAY_USER_TOKEN",
+        "TAVILY_API_KEY",
+    )
 
     def setup_method(self):
         for key in self._ENV_KEYS:

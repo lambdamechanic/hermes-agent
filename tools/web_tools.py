@@ -12,7 +12,7 @@ Available tools:
 - web_crawl_tool: Crawl websites with specific instructions
 
 Backend compatibility:
-- Firecrawl: https://docs.firecrawl.dev/introduction (search, extract, crawl; direct or via tool-gateway)
+- Firecrawl: https://docs.firecrawl.dev/introduction (search, extract, crawl; direct, legacy TOOL_GATEWAY_URL, or derived firecrawl-gateway.<domain>)
 - Parallel: https://docs.parallel.ai (search, extract)
 - Tavily: https://tavily.com (search, extract, crawl)
 
@@ -99,7 +99,8 @@ def _get_backend() -> str:
 
 _firecrawl_client = None
 _firecrawl_client_config = None
-_DEFAULT_TOOL_GATEWAY_URL = "https://tool-gateway.rewbs.uk"
+_DEFAULT_TOOL_GATEWAY_DOMAIN = "nousresearch.com"
+_DEFAULT_TOOL_GATEWAY_SCHEME = "https"
 
 
 def _get_auth_json_path() -> Path:
@@ -129,8 +130,40 @@ def _get_direct_firecrawl_config() -> Optional[tuple[Dict[str, str], tuple[str, 
 
 
 def _get_tool_gateway_url() -> str:
-    """Return configured tool-gateway base URL (without trailing slash)."""
-    return os.getenv("TOOL_GATEWAY_URL", _DEFAULT_TOOL_GATEWAY_URL).strip().rstrip("/")
+    """Return legacy shared tool-gateway base URL when explicitly configured."""
+    return os.getenv("TOOL_GATEWAY_URL", "").strip().rstrip("/")
+
+
+def _build_vendor_gateway_origin(vendor: str) -> str:
+    """Return the gateway origin for a specific vendor."""
+    vendor_key = f"{vendor.upper().replace('-', '_')}_GATEWAY_URL"
+    explicit_vendor_url = os.getenv(vendor_key, "").strip().rstrip("/")
+    if explicit_vendor_url:
+        return explicit_vendor_url
+
+    shared_domain = os.getenv("TOOL_GATEWAY_DOMAIN", "").strip().strip("/")
+    if shared_domain:
+        return f"{_get_tool_gateway_scheme()}://{vendor}-gateway.{shared_domain}"
+
+    return f"{_get_tool_gateway_scheme()}://{vendor}-gateway.{_DEFAULT_TOOL_GATEWAY_DOMAIN}"
+
+
+def _get_tool_gateway_scheme() -> str:
+    """Return configured shared gateway URL scheme."""
+    scheme = os.getenv("TOOL_GATEWAY_SCHEME", "").strip().lower()
+    if not scheme:
+        return _DEFAULT_TOOL_GATEWAY_SCHEME
+    if scheme in {"http", "https"}:
+        return scheme
+    raise ValueError("TOOL_GATEWAY_SCHEME must be 'http' or 'https'")
+
+
+def _get_firecrawl_gateway_url() -> str:
+    """Return configured Firecrawl gateway URL."""
+    legacy_gateway_url = _get_tool_gateway_url()
+    if legacy_gateway_url:
+        return legacy_gateway_url + "/api/tools/firecrawl"
+    return _build_vendor_gateway_origin("firecrawl")
 
 
 def _read_nous_access_token() -> Optional[str]:
@@ -160,7 +193,7 @@ def _read_nous_access_token() -> Optional[str]:
 
 def _is_tool_gateway_ready() -> bool:
     """Return True when gateway URL and user auth token are available."""
-    return bool(_get_tool_gateway_url()) and bool(_read_nous_access_token())
+    return bool(_get_firecrawl_gateway_url()) and bool(_read_nous_access_token())
 
 
 def _has_direct_firecrawl_config() -> bool:
@@ -173,7 +206,7 @@ def _raise_web_backend_configuration_error() -> None:
     raise ValueError(
         "Web tools are not configured. "
         "Set FIRECRAWL_API_KEY for cloud Firecrawl, set FIRECRAWL_API_URL for a self-hosted Firecrawl instance, "
-        "or login to Nous (`hermes model`) and provide TOOL_GATEWAY_URL."
+        "or login to Nous (`hermes model`) and provide FIRECRAWL_GATEWAY_URL, TOOL_GATEWAY_DOMAIN, or TOOL_GATEWAY_URL."
     )
 
 
@@ -189,14 +222,14 @@ def _get_firecrawl_client():
     if direct_config is not None:
         kwargs, client_config = direct_config
     else:
-        gateway_url = _get_tool_gateway_url()
+        gateway_url = _get_firecrawl_gateway_url()
         gateway_token = _read_nous_access_token()
         if not gateway_url or not gateway_token:
             _raise_web_backend_configuration_error()
 
         kwargs = {
             "api_key": gateway_token,
-            "api_url": gateway_url + "/api/tools/firecrawl",
+            "api_url": gateway_url,
         }
         client_config = ("tool-gateway", kwargs["api_url"], gateway_token)
 
@@ -1372,7 +1405,7 @@ async def web_crawl_tool(
         if not check_firecrawl_api_key():
             return json.dumps({
                 "error": "web_crawl requires Firecrawl. Set FIRECRAWL_API_KEY, FIRECRAWL_API_URL, "
-                         "or login to Nous for the Firecrawl tool-gateway, "
+                         "or login to Nous and use FIRECRAWL_GATEWAY_URL, TOOL_GATEWAY_DOMAIN, or TOOL_GATEWAY_URL, "
                          "or use web_search + web_extract instead.",
                 "success": False,
             }, ensure_ascii=False)
@@ -1645,6 +1678,10 @@ def check_firecrawl_api_key() -> bool:
     """
     Check whether the Firecrawl backend is available.
 
+    Availability is true when either:
+    1) direct Firecrawl config (`FIRECRAWL_API_KEY` or `FIRECRAWL_API_URL`), or
+    2) Firecrawl gateway origin + Nous access token (fallback when direct Firecrawl is not configured).
+
     Returns:
         bool: True if direct Firecrawl or the tool-gateway can be used.
     """
@@ -1697,12 +1734,12 @@ if __name__ == "__main__":
             elif firecrawl_key_available:
                 print("   Using direct Firecrawl cloud API")
             elif tool_gateway_available:
-                print(f"   Using Firecrawl tool-gateway: {_get_tool_gateway_url()}")
+                print(f"   Using Firecrawl tool-gateway: {_get_firecrawl_gateway_url()}")
             else:
                 print("   Firecrawl backend selected but not configured")
     else:
         print("❌ No web search backend configured")
-        print("Set PARALLEL_API_KEY, TAVILY_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_API_URL, or login to Nous for the tool-gateway")
+        print("Set PARALLEL_API_KEY, TAVILY_API_KEY, FIRECRAWL_API_KEY, FIRECRAWL_API_URL, or login to Nous and use FIRECRAWL_GATEWAY_URL, TOOL_GATEWAY_DOMAIN, or TOOL_GATEWAY_URL")
 
     if not nous_available:
         print("❌ No auxiliary model available for LLM content processing")
@@ -1812,7 +1849,17 @@ registry.register(
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=5),
     check_fn=check_web_api_key,
-    requires_env=["PARALLEL_API_KEY", "TAVILY_API_KEY", "TOOL_GATEWAY_URL", "TOOL_GATEWAY_USER_TOKEN", "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL"],
+    requires_env=[
+        "PARALLEL_API_KEY",
+        "TAVILY_API_KEY",
+        "TOOL_GATEWAY_URL",
+        "FIRECRAWL_GATEWAY_URL",
+        "TOOL_GATEWAY_DOMAIN",
+        "TOOL_GATEWAY_SCHEME",
+        "TOOL_GATEWAY_USER_TOKEN",
+        "FIRECRAWL_API_KEY",
+        "FIRECRAWL_API_URL",
+    ],
     emoji="🔍",
 )
 registry.register(
@@ -1822,7 +1869,17 @@ registry.register(
     handler=lambda args, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
     check_fn=check_web_api_key,
-    requires_env=["PARALLEL_API_KEY", "TAVILY_API_KEY", "TOOL_GATEWAY_URL", "TOOL_GATEWAY_USER_TOKEN", "FIRECRAWL_API_KEY", "FIRECRAWL_API_URL"],
+    requires_env=[
+        "PARALLEL_API_KEY",
+        "TAVILY_API_KEY",
+        "TOOL_GATEWAY_URL",
+        "FIRECRAWL_GATEWAY_URL",
+        "TOOL_GATEWAY_DOMAIN",
+        "TOOL_GATEWAY_SCHEME",
+        "TOOL_GATEWAY_USER_TOKEN",
+        "FIRECRAWL_API_KEY",
+        "FIRECRAWL_API_URL",
+    ],
     is_async=True,
     emoji="📄",
 )

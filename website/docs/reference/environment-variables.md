@@ -78,6 +78,10 @@ For native Anthropic auth, Hermes prefers Claude Code's own credential files whe
 | `FIRECRAWL_API_KEY` | Web scraping ([firecrawl.dev](https://firecrawl.dev/)) |
 | `FIRECRAWL_API_URL` | Custom Firecrawl API endpoint for self-hosted instances (optional) |
 | `TAVILY_API_KEY` | Tavily API key for AI-native web search, extract, and crawl ([app.tavily.com](https://app.tavily.com/home)) |
+| `FIRECRAWL_GATEWAY_URL` | Exact Firecrawl tool-gateway origin override, for example `https://firecrawl-gateway.rewbs.uk` |
+| `TOOL_GATEWAY_DOMAIN` | Shared tool-gateway domain suffix used to derive vendor hosts, for example `rewbs.uk` -> `firecrawl-gateway.rewbs.uk` |
+| `TOOL_GATEWAY_SCHEME` | Shared tool-gateway URL scheme used to derive vendor hosts, `https` by default and `http` for local gateway testing |
+| `TOOL_GATEWAY_USER_TOKEN` | Explicit Nous access token for tool-gateway calls (optional; otherwise Hermes reads `~/.hermes/auth.json`) |
 | `BROWSERBASE_API_KEY` | Browser automation ([browserbase.com](https://browserbase.com/)) |
 | `BROWSERBASE_PROJECT_ID` | Browserbase project ID |
 | `BROWSER_USE_API_KEY` | Browser Use cloud browser API key ([browser-use.com](https://browser-use.com/)) |
