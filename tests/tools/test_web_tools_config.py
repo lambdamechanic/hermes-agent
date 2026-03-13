@@ -8,9 +8,11 @@ Coverage:
   check_web_api_key() — unified availability check across all web backends.
 """
 
+import importlib
+import json
 import os
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 
 class TestFirecrawlClientConfig:
@@ -179,7 +181,71 @@ class TestFirecrawlClientConfig:
                 with patch("tools.web_tools.Firecrawl") as mock_fc:
                     from tools.web_tools import _get_firecrawl_client
                     _get_firecrawl_client()
-                    mock_fc.assert_called_once_with(api_key="fc-test")
+                mock_fc.assert_called_once_with(api_key="fc-test")
+
+    def test_nous_auth_token_respects_hermes_home_override(self, tmp_path):
+        """Auth lookup should read from HERMES_HOME/auth.json, not ~/.hermes/auth.json."""
+        real_home = tmp_path / "real-home"
+        (real_home / ".hermes").mkdir(parents=True)
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "auth.json").write_text(json.dumps({
+            "providers": {
+                "nous": {
+                    "access_token": "nous-token",
+                }
+            }
+        }))
+
+        with patch.dict(os.environ, {
+            "HOME": str(real_home),
+            "HERMES_HOME": str(hermes_home),
+        }, clear=False):
+            import tools.web_tools
+            importlib.reload(tools.web_tools)
+            assert tools.web_tools._read_nous_access_token() == "nous-token"
+
+    def test_check_auxiliary_model_re_resolves_backend_each_call(self):
+        """Availability checks should not be pinned to module import state."""
+        import tools.web_tools
+
+        # Simulate the pre-fix import-time cache slot for regression coverage.
+        tools.web_tools.__dict__["_aux_async_client"] = None
+
+        with patch(
+            "tools.web_tools.get_async_text_auxiliary_client",
+            side_effect=[(None, None), (MagicMock(base_url="https://api.openrouter.ai/v1"), "test-model")],
+        ):
+            assert tools.web_tools.check_auxiliary_model() is False
+            assert tools.web_tools.check_auxiliary_model() is True
+
+    @pytest.mark.asyncio
+    async def test_summarizer_re_resolves_backend_after_initial_unavailable_state(self):
+        """Summarization should pick up a backend that becomes available later in-process."""
+        import tools.web_tools
+
+        tools.web_tools.__dict__["_aux_async_client"] = None
+
+        response = MagicMock()
+        response.choices = [MagicMock(message=MagicMock(content="summary text"))]
+
+        fake_client = MagicMock(base_url="https://api.openrouter.ai/v1")
+        fake_client.chat.completions.create = AsyncMock(return_value=response)
+
+        with patch(
+            "tools.web_tools.get_async_text_auxiliary_client",
+            side_effect=[(None, None), (fake_client, "test-model")],
+        ):
+            assert tools.web_tools.check_auxiliary_model() is False
+            result = await tools.web_tools._call_summarizer_llm(
+                "Some content worth summarizing",
+                "Source: https://example.com\n\n",
+                None,
+            )
+
+        assert result == "summary text"
+        fake_client.chat.completions.create.assert_awaited_once()
 
     # ── Singleton caching ────────────────────────────────────────────
 
