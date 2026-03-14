@@ -63,10 +63,30 @@ You need these five values from the X Developer Portal:
 Get them from:
 - https://developer.x.com/en/portal/dashboard
 
+### Why does X need 5 secrets?
+
+Unfortunately, the official X API splits auth across both app-level and user-level credentials:
+
+- `X_API_KEY` + `X_API_SECRET` identify your app
+- `X_BEARER_TOKEN` is used for app-level read access
+- `X_ACCESS_TOKEN` + `X_ACCESS_TOKEN_SECRET` let the CLI act as your user account for writes and authenticated actions
+
+So yes — it is a lot of secrets for one integration, but this is the stable official API path and is still preferable to cookie/session scraping.
+
 Setup requirements in the portal:
 1. Create or open your app
 2. In user authentication settings, set permissions to `Read and write`
 3. Generate or regenerate the access token + access token secret after enabling write permissions
+4. Save all five values carefully — missing any one of them will usually produce confusing auth or permission errors
+
+Note: upstream `x-cli` expects the full credential set to be present, so even if you mostly care about read-only commands, it is simplest to configure all five.
+
+## Cost / Friction Reality Check
+
+If this setup feels heavier than it should be, that is because it is. X’s official developer flow is high-friction and often paid. This skill chooses the official API path because it is more stable and maintainable than browser-cookie/session approaches.
+
+If the user wants the least brittle long-term setup, use this skill. If they want a zero-setup or unofficial path, that is a different trade-off and not what this skill is for.
+
 
 ## Where to Store Credentials
 
