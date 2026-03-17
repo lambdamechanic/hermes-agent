@@ -36,19 +36,36 @@ def _install_fake_tools_package():
 
 
 def _install_fake_fal_client(captured):
-    client_module = types.SimpleNamespace(FAL_QUEUE_RUN_HOST=None, QUEUE_RUN_URL=None)
+    client_module = types.SimpleNamespace(
+        FAL_QUEUE_RUN_HOST="queue.fal.run",
+        QUEUE_RUN_URL=None,
+        QUEUE_URL_FORMAT="https://queue.fal.run/",
+    )
+    auth_module = types.SimpleNamespace(FAL_QUEUE_RUN_HOST="queue.fal.run")
 
     def submit(model, arguments=None, headers=None):
-        captured["model"] = model
-        captured["arguments"] = arguments
-        captured["headers"] = headers
-        captured["queue_run_host"] = client_module.FAL_QUEUE_RUN_HOST
-        captured["queue_run_url"] = client_module.QUEUE_RUN_URL
-        return types.SimpleNamespace(get=lambda: {"images": []})
+        raise AssertionError("managed FAL gateway mode should use fal_client.SyncClient")
+
+    class SyncClient:
+        def __init__(self, key=None):
+            captured["client_key"] = key
+
+        def submit(self, model, arguments=None, headers=None):
+            captured["submit_via"] = "sync_client"
+            captured["model"] = model
+            captured["arguments"] = arguments
+            captured["headers"] = headers
+            captured["queue_run_host"] = client_module.FAL_QUEUE_RUN_HOST
+            captured["queue_run_url"] = client_module.QUEUE_RUN_URL
+            captured["queue_url_format"] = client_module.QUEUE_URL_FORMAT
+            captured["auth_queue_run_host"] = auth_module.FAL_QUEUE_RUN_HOST
+            return types.SimpleNamespace(get=lambda: {"images": []})
 
     fal_client_module = types.SimpleNamespace(
         submit=submit,
+        SyncClient=SyncClient,
         client=client_module,
+        auth=auth_module,
     )
     sys.modules["fal_client"] = fal_client_module
     return fal_client_module
@@ -108,10 +125,16 @@ def test_managed_fal_submit_uses_gateway_origin_and_nous_token(monkeypatch):
     )
 
     assert captured["model"] == "fal-ai/flux-2-pro"
+    assert captured["submit_via"] == "sync_client"
+    assert captured["client_key"] == "nous-token"
     assert captured["queue_run_host"] == "127.0.0.1:3009"
     assert captured["queue_run_url"] == "http://127.0.0.1:3009"
+    assert captured["queue_url_format"] == "http://127.0.0.1:3009/"
+    assert captured["auth_queue_run_host"] == "127.0.0.1:3009"
     assert sys.modules["fal_client"].client.QUEUE_RUN_URL is None
-    assert captured["headers"]["Authorization"] == "Key nous-token"
+    assert sys.modules["fal_client"].client.QUEUE_URL_FORMAT == "https://queue.fal.run/"
+    assert sys.modules["fal_client"].auth.FAL_QUEUE_RUN_HOST == "queue.fal.run"
+    assert captured["headers"] is None
 
 
 def test_openai_tts_uses_managed_audio_gateway_when_direct_key_absent(monkeypatch, tmp_path):

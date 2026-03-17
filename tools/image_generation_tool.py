@@ -80,6 +80,7 @@ VALID_OUTPUT_FORMATS = ["jpeg", "png"]
 VALID_ACCELERATION_MODES = ["none", "regular", "high"]
 
 _debug = DebugSession("image_tools", env_var="IMAGE_TOOLS_DEBUG")
+_MISSING = object()
 
 
 def _resolve_managed_fal_gateway():
@@ -96,21 +97,29 @@ def _override_fal_queue_host(queue_run_origin: Optional[str]):
         yield
         return
 
-    parsed_origin = urlparse(queue_run_origin)
+    normalized_origin = queue_run_origin.rstrip("/")
+    parsed_origin = urlparse(normalized_origin)
     queue_run_host = parsed_origin.netloc or parsed_origin.path
     if not queue_run_host:
         yield
         return
 
+    queue_url_format = f"{normalized_origin}/"
     previous_env = os.environ.get("FAL_QUEUE_RUN_HOST")
-    previous_module_host = getattr(getattr(fal_client, "client", None), "FAL_QUEUE_RUN_HOST", None)
-    previous_module_url = getattr(getattr(fal_client, "client", None), "QUEUE_RUN_URL", None)
+    patched_attributes = []
+
+    def _patch_attr(target: Any, name: str, value: Any):
+        if target is None:
+            return
+        previous = getattr(target, name, _MISSING)
+        patched_attributes.append((target, name, previous))
+        setattr(target, name, value)
 
     os.environ["FAL_QUEUE_RUN_HOST"] = queue_run_host
-    if hasattr(getattr(fal_client, "client", None), "FAL_QUEUE_RUN_HOST"):
-        fal_client.client.FAL_QUEUE_RUN_HOST = queue_run_host
-    if hasattr(getattr(fal_client, "client", None), "QUEUE_RUN_URL"):
-        fal_client.client.QUEUE_RUN_URL = queue_run_origin.rstrip("/")
+    _patch_attr(getattr(fal_client, "auth", None), "FAL_QUEUE_RUN_HOST", queue_run_host)
+    _patch_attr(getattr(fal_client, "client", None), "FAL_QUEUE_RUN_HOST", queue_run_host)
+    _patch_attr(getattr(fal_client, "client", None), "QUEUE_RUN_URL", normalized_origin)
+    _patch_attr(getattr(fal_client, "client", None), "QUEUE_URL_FORMAT", queue_url_format)
 
     try:
         yield
@@ -120,10 +129,11 @@ def _override_fal_queue_host(queue_run_origin: Optional[str]):
         else:
             os.environ["FAL_QUEUE_RUN_HOST"] = previous_env
 
-        if hasattr(getattr(fal_client, "client", None), "FAL_QUEUE_RUN_HOST"):
-            fal_client.client.FAL_QUEUE_RUN_HOST = previous_module_host
-        if hasattr(getattr(fal_client, "client", None), "QUEUE_RUN_URL"):
-            fal_client.client.QUEUE_RUN_URL = previous_module_url
+        for target, name, previous in reversed(patched_attributes):
+            if previous is _MISSING:
+                delattr(target, name)
+            else:
+                setattr(target, name, previous)
 
 
 def _submit_fal_request(model: str, arguments: Dict[str, Any]):
@@ -132,14 +142,15 @@ def _submit_fal_request(model: str, arguments: Dict[str, Any]):
     if managed_gateway is None:
         return fal_client.submit(model, arguments=arguments)
 
-    headers = {
-        "Authorization": f"Key {managed_gateway.nous_user_token}",
-    }
+    sync_client_class = getattr(fal_client, "SyncClient", None)
+    if sync_client_class is None:
+        raise RuntimeError("fal_client.SyncClient is required for managed FAL gateway mode")
+
+    managed_client = sync_client_class(key=managed_gateway.nous_user_token)
     with _override_fal_queue_host(managed_gateway.gateway_origin):
-        return fal_client.submit(
+        return managed_client.submit(
             model,
             arguments=arguments,
-            headers=headers,
         )
 
 
@@ -445,10 +456,12 @@ def image_generate_tool(
         error_msg = f"Error generating image: {str(e)}"
         logger.error("%s", error_msg, exc_info=True)
         
-        # Prepare error response - minimal format
+        # Include error details so callers can diagnose failures
         response_data = {
             "success": False,
-            "image": None
+            "image": None,
+            "error": str(e),
+            "error_type": type(e).__name__,
         }
         
         debug_call_data["error"] = error_msg
