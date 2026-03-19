@@ -43,9 +43,20 @@ class ManagedModalEnvironment(BaseEnvironment):
     def execute(self, command: str, cwd: str = "", *,
                 timeout: int | None = None,
                 stdin_data: str | None = None) -> dict:
+        exec_command, sudo_stdin = self._prepare_command(command)
+
+        # When a sudo password is present, inject it via a shell-level pipe
+        # (same approach as the direct ModalEnvironment) since the gateway
+        # cannot pipe subprocess stdin directly.
+        if sudo_stdin is not None:
+            import shlex
+            exec_command = (
+                f"printf '%s\\n' {shlex.quote(sudo_stdin.rstrip())} | {exec_command}"
+            )
+
         exec_cwd = cwd or self.cwd
         payload: Dict[str, Any] = {
-            "command": command,
+            "command": exec_command,
             "cwd": exec_cwd,
             "timeoutMs": int((timeout or self.timeout) * 1000),
         }
@@ -93,20 +104,28 @@ class ManagedModalEnvironment(BaseEnvironment):
             self._sandbox_kwargs.get("memoryMiB", self._sandbox_kwargs.get("memory")),
             5120,
         )
+        disk = self._coerce_number(
+            self._sandbox_kwargs.get("ephemeral_disk", self._sandbox_kwargs.get("diskMiB")),
+            None,
+        )
+
+        create_payload = {
+            "image": self._image,
+            "cwd": self.cwd,
+            "cpu": cpu,
+            "memoryMiB": memory,
+            "timeoutMs": 3_600_000,
+            "idleTimeoutMs": max(300_000, int(self.timeout * 1000)),
+            "persistentFilesystem": self._persistent,
+            "logicalKey": self._task_id,
+        }
+        if disk is not None:
+            create_payload["diskMiB"] = disk
 
         response = self._request(
             "POST",
             "/v1/sandboxes",
-            json={
-                "image": self._image,
-                "cwd": self.cwd,
-                "cpu": cpu,
-                "memoryMiB": memory,
-                "timeoutMs": 3_600_000,
-                "idleTimeoutMs": max(300_000, int(self.timeout * 1000)),
-                "persistentFilesystem": self._persistent,
-                "logicalKey": self._task_id,
-            },
+            json=create_payload,
             timeout=60,
         )
         if response.status_code >= 400:
