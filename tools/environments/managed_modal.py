@@ -4,18 +4,33 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import requests
+import time
 import uuid
 from typing import Any, Dict, Optional
 
 from tools.environments.base import BaseEnvironment
+from tools.interrupt import is_interrupted
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 
 logger = logging.getLogger(__name__)
 
 
+def _request_timeout_env(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
 class ManagedModalEnvironment(BaseEnvironment):
     """Gateway-owned Modal sandbox with Hermes-compatible execute/cleanup."""
+
+    _CONNECT_TIMEOUT_SECONDS = _request_timeout_env("TERMINAL_MANAGED_MODAL_CONNECT_TIMEOUT_SECONDS", 1.0)
+    _POLL_READ_TIMEOUT_SECONDS = _request_timeout_env("TERMINAL_MANAGED_MODAL_POLL_READ_TIMEOUT_SECONDS", 5.0)
+    _CANCEL_READ_TIMEOUT_SECONDS = _request_timeout_env("TERMINAL_MANAGED_MODAL_CANCEL_READ_TIMEOUT_SECONDS", 5.0)
 
     def __init__(
         self,
@@ -55,29 +70,99 @@ class ManagedModalEnvironment(BaseEnvironment):
             )
 
         exec_cwd = cwd or self.cwd
+        effective_timeout = timeout or self.timeout
+        exec_id = str(uuid.uuid4())
         payload: Dict[str, Any] = {
+            "execId": exec_id,
             "command": exec_command,
             "cwd": exec_cwd,
-            "timeoutMs": int((timeout or self.timeout) * 1000),
+            "timeoutMs": int(effective_timeout * 1000),
         }
         if stdin_data is not None:
             payload["stdinData"] = stdin_data
 
-        response = self._request(
-            "POST",
-            f"/v1/sandboxes/{self._sandbox_id}/exec",
-            json=payload,
-        )
+        try:
+            response = self._request(
+                "POST",
+                f"/v1/sandboxes/{self._sandbox_id}/execs",
+                json=payload,
+                timeout=10,
+            )
+        except Exception as exc:
+            return {
+                "output": f"Managed Modal exec failed: {exc}",
+                "returncode": 1,
+            }
+
         if response.status_code >= 400:
             return {
                 "output": self._format_error("Managed Modal exec failed", response),
-                "returncode": 1 if response.status_code != 504 else 124,
+                "returncode": 1,
             }
 
         body = response.json()
+        status = body.get("status")
+        if status in {"completed", "failed", "cancelled", "timeout"}:
+            return {
+                "output": body.get("output", ""),
+                "returncode": body.get("returncode", 1),
+            }
+
+        if body.get("execId") != exec_id:
+            return {
+                "output": "Managed Modal exec start did not return the expected exec id",
+                "returncode": 1,
+            }
+
+        poll_interval = 0.25
+        deadline = time.monotonic() + effective_timeout + 10
+
+        while time.monotonic() < deadline:
+            if is_interrupted():
+                self._cancel_exec(exec_id)
+                return {
+                    "output": "[Command interrupted - Modal sandbox exec cancelled]",
+                    "returncode": 130,
+                }
+
+            try:
+                status_response = self._request(
+                    "GET",
+                    f"/v1/sandboxes/{self._sandbox_id}/execs/{exec_id}",
+                    timeout=(self._CONNECT_TIMEOUT_SECONDS, self._POLL_READ_TIMEOUT_SECONDS),
+                )
+            except Exception as exc:
+                return {
+                    "output": f"Managed Modal exec poll failed: {exc}",
+                    "returncode": 1,
+                }
+
+            if status_response.status_code == 404:
+                return {
+                    "output": "Managed Modal exec not found",
+                    "returncode": 1,
+                }
+
+            if status_response.status_code >= 400:
+                return {
+                    "output": self._format_error("Managed Modal exec poll failed", status_response),
+                    "returncode": 1,
+                }
+
+            status_body = status_response.json()
+            status = status_body.get("status")
+            if status in {"completed", "failed", "cancelled", "timeout"}:
+                return {
+                    "output": status_body.get("output", ""),
+                    "returncode": status_body.get("returncode", 1),
+                }
+
+            time.sleep(poll_interval)
+
+        self._cancel_exec(exec_id)
         return {
-            "output": body.get("output", ""),
-            "returncode": body.get("returncode", 1),
+            "output": f"Managed Modal exec timed out after {effective_timeout}s",
+            "returncode": 124,
         }
 
     def cleanup(self):
@@ -150,6 +235,16 @@ class ManagedModalEnvironment(BaseEnvironment):
             json=json,
             timeout=timeout,
         )
+
+    def _cancel_exec(self, exec_id: str) -> None:
+        try:
+            self._request(
+                "POST",
+                f"/v1/sandboxes/{self._sandbox_id}/execs/{exec_id}/cancel",
+                timeout=(self._CONNECT_TIMEOUT_SECONDS, self._CANCEL_READ_TIMEOUT_SECONDS),
+            )
+        except Exception as exc:
+            logger.warning("Managed Modal exec cancel failed: %s", exc)
 
     @staticmethod
     def _coerce_number(value: Any, default: float) -> float:

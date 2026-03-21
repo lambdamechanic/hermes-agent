@@ -811,7 +811,8 @@ PROCESS_SCHEMA = {
         "Actions: 'list' (show all), 'poll' (check status + new output), "
         "'log' (full output with pagination), 'wait' (block until done or timeout), "
         "'kill' (terminate), 'write' (send raw stdin data without newline), "
-        "'submit' (send data + Enter, for answering prompts)."
+        "'submit' (send data + Enter, for answering prompts). "
+        "Background processes live only as long as the current sandbox stays alive; resumable cloud sandboxes preserve files, not process continuity."
     ),
     "parameters": {
         "type": "object",

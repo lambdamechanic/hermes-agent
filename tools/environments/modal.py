@@ -20,6 +20,7 @@ from tools.interrupt import is_interrupted
 logger = logging.getLogger(__name__)
 
 _SNAPSHOT_STORE = get_hermes_home() / "modal_snapshots.json"
+_DIRECT_SNAPSHOT_NAMESPACE = "direct"
 
 
 def _load_snapshots() -> Dict[str, str]:
@@ -36,6 +37,51 @@ def _save_snapshots(data: Dict[str, str]) -> None:
     """Persist snapshot ID mapping to disk."""
     _SNAPSHOT_STORE.parent.mkdir(parents=True, exist_ok=True)
     _SNAPSHOT_STORE.write_text(json.dumps(data, indent=2))
+
+
+def _direct_snapshot_key(task_id: str) -> str:
+    return f"{_DIRECT_SNAPSHOT_NAMESPACE}:{task_id}"
+
+
+def _get_snapshot_restore_candidate(task_id: str) -> tuple[str | None, bool]:
+    """Return a snapshot id for direct Modal restore and whether the key is legacy."""
+    snapshots = _load_snapshots()
+
+    namespaced_key = _direct_snapshot_key(task_id)
+    snapshot_id = snapshots.get(namespaced_key)
+    if isinstance(snapshot_id, str) and snapshot_id:
+        return snapshot_id, False
+
+    legacy_snapshot_id = snapshots.get(task_id)
+    if isinstance(legacy_snapshot_id, str) and legacy_snapshot_id:
+        return legacy_snapshot_id, True
+
+    return None, False
+
+
+def _store_direct_snapshot(task_id: str, snapshot_id: str) -> None:
+    """Persist the direct Modal snapshot id under the direct namespace."""
+    snapshots = _load_snapshots()
+    snapshots[_direct_snapshot_key(task_id)] = snapshot_id
+    snapshots.pop(task_id, None)
+    _save_snapshots(snapshots)
+
+
+def _delete_direct_snapshot(task_id: str, snapshot_id: str | None = None) -> None:
+    """Remove direct Modal snapshot entries for a task, including legacy keys."""
+    snapshots = _load_snapshots()
+    updated = False
+
+    for key in (_direct_snapshot_key(task_id), task_id):
+        value = snapshots.get(key)
+        if value is None:
+            continue
+        if snapshot_id is None or value == snapshot_id:
+            snapshots.pop(key, None)
+            updated = True
+
+    if updated:
+        _save_snapshots(snapshots)
 
 
 class ModalEnvironment(BaseEnvironment):
@@ -74,30 +120,49 @@ class ModalEnvironment(BaseEnvironment):
         sandbox_kwargs = dict(modal_sandbox_kwargs or {})
 
         # If persistent, try to restore from a previous snapshot
-        restored_image = None
+        restored_snapshot_id = None
+        restored_from_legacy_key = False
         if self._persistent:
-            snapshot_id = _load_snapshots().get(self._task_id)
-            if snapshot_id:
-                try:
-                    import modal
-                    restored_image = modal.Image.from_id(snapshot_id)
-                    logger.info("Modal: restoring from snapshot %s", snapshot_id[:20])
-                except Exception as e:
-                    logger.warning("Modal: failed to restore snapshot, using base image: %s", e)
-                    restored_image = None
+            restored_snapshot_id, restored_from_legacy_key = _get_snapshot_restore_candidate(self._task_id)
+            if restored_snapshot_id:
+                logger.info("Modal: restoring from snapshot %s", restored_snapshot_id[:20])
 
-        effective_image = restored_image if restored_image else image
+        effective_image = restored_snapshot_id or image
 
         from minisweagent.environments.extra.swerex_modal import SwerexModalEnvironment
-        self._inner = SwerexModalEnvironment(
-            image=effective_image,
-            cwd=cwd,
-            timeout=timeout,
-            startup_timeout=180.0,
-            runtime_timeout=3600.0,
-            modal_sandbox_kwargs=sandbox_kwargs,
-            install_pipx=True,  # Required: installs pipx + swe-rex runtime (swerex-remote)
-        )
+        try:
+            self._inner = SwerexModalEnvironment(
+                image=effective_image,
+                cwd=cwd,
+                timeout=timeout,
+                startup_timeout=180.0,
+                runtime_timeout=3600.0,
+                modal_sandbox_kwargs=sandbox_kwargs,
+                install_pipx=True,  # Required: installs pipx + swe-rex runtime (swerex-remote)
+            )
+        except Exception as exc:
+            if not restored_snapshot_id:
+                raise
+
+            logger.warning(
+                "Modal: failed to restore snapshot %s, retrying with base image: %s",
+                restored_snapshot_id[:20],
+                exc,
+            )
+            _delete_direct_snapshot(self._task_id, restored_snapshot_id)
+            self._inner = SwerexModalEnvironment(
+                image=image,
+                cwd=cwd,
+                timeout=timeout,
+                startup_timeout=180.0,
+                runtime_timeout=3600.0,
+                modal_sandbox_kwargs=sandbox_kwargs,
+                install_pipx=True,
+            )
+        else:
+            if restored_snapshot_id and restored_from_legacy_key:
+                _store_direct_snapshot(self._task_id, restored_snapshot_id)
+                logger.info("Modal: migrated legacy snapshot entry for task %s", self._task_id)
 
     def execute(self, command: str, cwd: str = "", *,
                 timeout: int | None = None,
@@ -174,9 +239,7 @@ class ModalEnvironment(BaseEnvironment):
                                 asyncio.run, _snapshot()
                             ).result(timeout=60)
 
-                    snapshots = _load_snapshots()
-                    snapshots[self._task_id] = snapshot_id
-                    _save_snapshots(snapshots)
+                    _store_direct_snapshot(self._task_id, snapshot_id)
                     logger.info("Modal: saved filesystem snapshot %s for task %s",
                                 snapshot_id[:20], self._task_id)
             except Exception as e:

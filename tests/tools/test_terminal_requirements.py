@@ -64,6 +64,7 @@ def test_modal_backend_without_token_or_config_logs_specific_error(monkeypatch, 
     monkeypatch.setenv("TERMINAL_ENV", "modal")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(terminal_tool_module, "is_managed_tool_gateway_ready", lambda _vendor: False)
     monkeypatch.setattr(terminal_tool_module, "ensure_minisweagent_on_path", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(terminal_tool_module.importlib.util, "find_spec", lambda _name: object())
 
@@ -72,6 +73,26 @@ def test_modal_backend_without_token_or_config_logs_specific_error(monkeypatch, 
 
     assert ok is False
     assert any(
-        "Modal backend selected but no MODAL_TOKEN_ID environment variable" in record.getMessage()
+        "Modal backend selected but no direct Modal credentials/config or managed tool gateway was found" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_modal_backend_with_managed_gateway_does_not_require_direct_creds_or_minisweagent(monkeypatch, tmp_path):
+    _clear_terminal_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "modal")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(terminal_tool_module, "is_managed_tool_gateway_ready", lambda _vendor: True)
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "ensure_minisweagent_on_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+    monkeypatch.setattr(
+        terminal_tool_module.importlib.util,
+        "find_spec",
+        lambda _name: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+
+    assert terminal_tool_module.check_terminal_requirements() is True

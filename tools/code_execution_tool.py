@@ -697,7 +697,8 @@ _TOOL_DOC_LINES = [
      "    Replaces old_string with new_string in the file."),
     ("terminal",
      "  terminal(command: str, timeout=None, workdir=None) -> dict\n"
-     "    Foreground only (no background/pty). Returns {\"output\": \"...\", \"exit_code\": N}"),
+     "    Foreground only (no background/pty). Returns {\"output\": \"...\", \"exit_code\": N}. "
+     "Cloud sandbox files may resume later, but live processes are not durable."),
 ]
 
 
@@ -737,7 +738,8 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None) -> dict:
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
         "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
-        "terminal() is foreground-only (no background or pty).\n\n"
+        "terminal() is foreground-only (no background or pty). "
+        "If the session uses a cloud sandbox backend, treat it as resumable task state rather than a durable always-on machine.\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
         "datetime, collections, etc.) for processing between tool calls.\n\n"
         "Also available (no import needed — built into hermes_tools):\n"

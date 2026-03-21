@@ -122,13 +122,16 @@ def _patch_swerex_modal():
         import modal as _modal
         image_spec = self.config.image
         if isinstance(image_spec, str):
-            image_spec = _modal.Image.from_registry(
-                image_spec,
-                setup_dockerfile_commands=[
-                    "RUN rm -rf /usr/local/lib/python*/site-packages/pip* 2>/dev/null; "
-                    "python -m ensurepip --upgrade --default-pip 2>/dev/null || true",
-                ],
-            )
+            if image_spec.startswith("im-"):
+                image_spec = _modal.Image.from_id(image_spec)
+            else:
+                image_spec = _modal.Image.from_registry(
+                    image_spec,
+                    setup_dockerfile_commands=[
+                        "RUN rm -rf /usr/local/lib/python*/site-packages/pip* 2>/dev/null; "
+                        "python -m ensurepip --upgrade --default-pip 2>/dev/null || true",
+                    ],
+                )
 
         # Create AND start the deployment entirely on the worker's loop/thread
         # so all gRPC channels and async state are bound to that loop

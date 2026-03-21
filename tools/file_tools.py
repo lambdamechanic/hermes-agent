@@ -232,7 +232,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        import traceback; tb = traceback.format_exc()
+        return json.dumps({"error": str(e), "traceback": tb}, ensure_ascii=False)
 
 
 def get_read_files_summary(task_id: str = "default") -> list:
@@ -327,7 +328,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             result_json += "\n\n[Hint: old_string not found. Use read_file to verify the current content, or search_files to locate the text.]"
         return result_json
     except Exception as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        import traceback; tb = traceback.format_exc()
+        return json.dumps({"error": str(e), "traceback": tb}, ensure_ascii=False)
 
 
 def search_tool(pattern: str, target: str = "content", path: str = ".",
@@ -395,7 +397,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             result_json += f"\n\n[Hint: Results truncated. Use offset={next_offset} to see more, or narrow with a more specific pattern or file_glob.]"
         return result_json
     except Exception as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        import traceback; tb = traceback.format_exc()
+        return json.dumps({"error": str(e), "traceback": tb}, ensure_ascii=False)
 
 
 FILE_TOOLS = [

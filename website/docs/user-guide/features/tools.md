@@ -54,7 +54,7 @@ The terminal tool can execute commands in different environments:
 | `docker` | Isolated containers | Security, reproducibility |
 | `ssh` | Remote server | Sandboxing, keep agent away from its own code |
 | `singularity` | HPC containers | Cluster computing, rootless |
-| `modal` | Cloud execution | Serverless, scale |
+| `modal` | Cloud sandbox | Resumable task environments, not durable hosting |
 | `daytona` | Cloud sandbox workspace | Persistent remote dev environments |
 
 ### Configuration
@@ -108,6 +108,13 @@ uv pip install "swe-rex[modal]"
 modal setup
 hermes config set terminal.backend modal
 ```
+
+Hermes can use Modal in two modes:
+
+- **Direct Modal**: Hermes talks to your Modal account directly.
+- **Managed Modal**: Hermes talks to a gateway that owns the vendor credentials.
+
+In both cases, Modal is best treated as a task sandbox, not a deployment target. Persistent mode preserves filesystem state so later turns can resume your work, but Hermes may still clean up or recreate the live sandbox. Long-running servers and background processes are not guaranteed to survive idle cleanup, session teardown, or Hermes exit.
 
 ### Container Resources
 
