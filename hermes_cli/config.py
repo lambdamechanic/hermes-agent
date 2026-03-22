@@ -348,6 +348,13 @@ DEFAULT_CONFIG = {
         "mode": "manual",
     },
 
+    # Skills configuration.
+    "skills": {
+        # When true, also discover project-local skills from ./.hermes/skills
+        # and ./.agents/skills under the active terminal cwd's repo root.
+        "project_local": False,
+    },
+
     # Permanently allowed dangerous command patterns (added via "always" approval)
     "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only)

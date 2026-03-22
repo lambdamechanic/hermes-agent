@@ -71,7 +71,6 @@ import logging
 import os
 import re
 import sys
-import threading
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -107,16 +106,12 @@ _EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub"))
 _PROJECT_LOCAL_SKILL_DIRS = (".hermes/skills", ".agents/skills")
 _REMOTE_ENV_BACKENDS = frozenset({"docker", "singularity", "modal", "ssh", "daytona"})
 _secret_capture_callback = None
-_project_local_lock = threading.Lock()
-_session_trusted_projects: Set[str] = set()
-_session_denied_projects: Set[str] = set()
 
 
 @dataclass(frozen=True)
 class SkillSearchRoot:
     path: Path
     scope: str
-    project_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -195,7 +190,7 @@ def _current_skills_dir() -> Path:
     return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "skills"
 
 
-def _project_local_config(config: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def _project_local_enabled(config: Dict[str, Any] | None = None) -> bool:
     if config is None:
         try:
             from hermes_cli.config import load_config
@@ -205,18 +200,10 @@ def _project_local_config(config: Dict[str, Any] | None = None) -> Dict[str, Any
             config = {}
 
     skills_cfg = config.get("skills", {}) if isinstance(config, dict) else {}
-    project_local = skills_cfg.get("project_local", {})
-    if not isinstance(project_local, dict):
-        project_local = {}
-
-    trusted_projects = project_local.get("trusted_projects", [])
-    if not isinstance(trusted_projects, list):
-        trusted_projects = []
-
-    return {
-        "enabled": bool(project_local.get("enabled", True)),
-        "trusted_projects": {_normalize_project_key(p) for p in trusted_projects if str(p).strip()},
-    }
+    project_local = skills_cfg.get("project_local", False)
+    if isinstance(project_local, dict):
+        return bool(project_local.get("enabled", False))
+    return bool(project_local)
 
 
 def _discover_project_local_roots(
@@ -237,190 +224,20 @@ def _discover_project_local_roots(
                 SkillSearchRoot(
                     path=candidate.resolve(),
                     scope="project_local",
-                    project_root=repo_root,
                 )
             )
     return repo_root, roots
 
 
-def _scan_root_skill_names(root: SkillSearchRoot | Path) -> List[str]:
-    names: List[str] = []
-    seen: Set[str] = set()
-
-    if not isinstance(root, SkillSearchRoot):
-        inferred_scope = (
-            "user"
-            if _normalize_project_key(root) == _normalize_project_key(_current_skills_dir())
-            else "project_local"
-        )
-        root = SkillSearchRoot(path=Path(root), scope=inferred_scope)
-
-    for entry in _scan_skill_root(root):
-        if entry.name in seen:
-            continue
-        seen.add(entry.name)
-        names.append(entry.name)
-
-    return names
-
-
-def _build_project_local_approval_prompt(
-    repo_root: Path,
-    project_roots: List[SkillSearchRoot],
-) -> tuple[str, str]:
-    skill_names: List[str] = []
-    for root in project_roots:
-        skill_names.extend(_scan_root_skill_names(root))
-    skill_names = sorted(set(skill_names))
-
-    shadowed: List[str] = []
-    builtin_conflicts: List[str] = []
-    user_skills_dir = _current_skills_dir()
-    if skill_names and user_skills_dir.is_dir():
-        existing = set(
-            _scan_root_skill_names(SkillSearchRoot(path=user_skills_dir, scope="user"))
-        )
-        shadowed = [name for name in skill_names if name in existing]
-
-    try:
-        from hermes_cli.commands import COMMANDS as _BUILTIN_COMMANDS
-
-        builtins = set(_BUILTIN_COMMANDS)
-        builtin_conflicts = [
-            f"/{name.lower().replace(' ', '-').replace('_', '-')}"
-            for name in skill_names
-            if f"/{name.lower().replace(' ', '-').replace('_', '-')}" in builtins
-        ]
-    except Exception:
-        builtin_conflicts = []
-
-    rel_roots = []
-    for root in project_roots:
-        try:
-            rel_roots.append(str(root.path.relative_to(repo_root)))
-        except Exception:
-            rel_roots.append(str(root.path))
-
-    description_parts = [
-        f"Trust project-local skills from {repo_root}?",
-        f"Found {len(skill_names)} skill(s) in {', '.join(rel_roots)}.",
-    ]
-    if shadowed:
-        preview = ", ".join(shadowed[:5])
-        if len(shadowed) > 5:
-            preview += ", ..."
-        description_parts.append(
-            f"{len(shadowed)} would shadow existing installed skill(s): {preview}."
-        )
-    if builtin_conflicts:
-        preview = ", ".join(builtin_conflicts[:5])
-        if len(builtin_conflicts) > 5:
-            preview += ", ..."
-        description_parts.append(
-            f"{len(builtin_conflicts)} would reuse existing slash command name(s): {preview}."
-        )
-
-    return (
-        f"project-local skills from {repo_root}",
-        " ".join(part for part in description_parts if part),
-    )
-
-
-def _project_locals_allowed(
-    repo_root: Path,
-    *,
-    config: Dict[str, Any] | None = None,
-    allow_prompt: bool = False,
-    approval_callback=None,
-) -> bool:
-    settings = _project_local_config(config)
-    if not settings["enabled"]:
-        return False
-
-    repo_key = _normalize_project_key(repo_root)
-    with _project_local_lock:
-        if repo_key in _session_trusted_projects:
-            return True
-        if repo_key in _session_denied_projects:
-            return False
-
-    if repo_key in settings["trusted_projects"]:
-        with _project_local_lock:
-            _session_trusted_projects.add(repo_key)
-        return True
-
-    if not allow_prompt or approval_callback is None:
-        return False
-
-    _, project_roots = _discover_project_local_roots(repo_root)
-    if not project_roots:
-        return False
-
-    subject, description = _build_project_local_approval_prompt(
-        repo_root,
-        project_roots,
-    )
-    try:
-        choice = approval_callback(subject, description, allow_permanent=True)
-    except TypeError:
-        choice = approval_callback(subject, description)
-    except Exception:
-        choice = "deny"
-
-    if choice in {"once", "session", "always"}:
-        with _project_local_lock:
-            # Treat "once" as a transient in-process trust decision so the user
-            # isn't reprompted when the skill catalog is rebuilt during the same
-            # interactive session.
-            _session_trusted_projects.add(repo_key)
-            _session_denied_projects.discard(repo_key)
-        if choice == "always":
-            try:
-                from hermes_cli.config import load_config, save_config
-
-                config_data = load_config()
-                skills_cfg = config_data.setdefault("skills", {})
-                project_local_cfg = skills_cfg.setdefault("project_local", {})
-                trusted = project_local_cfg.setdefault("trusted_projects", [])
-                trusted_keys = {
-                    _normalize_project_key(item) for item in trusted if str(item).strip()
-                }
-                if repo_key not in trusted_keys:
-                    trusted.append(str(repo_root))
-                    project_local_cfg["trusted_projects"] = sorted(
-                        trusted,
-                        key=lambda item: _normalize_project_key(item),
-                    )
-                    save_config(config_data)
-            except Exception:
-                logger.debug(
-                    "Could not persist trusted project-local skill approval for %s",
-                    repo_root,
-                    exc_info=True,
-                )
-        return True
-
-    with _project_local_lock:
-        _session_denied_projects.add(repo_key)
-    return False
-
-
 def _skill_search_roots(
     *,
-    allow_project_prompt: bool = False,
-    approval_callback=None,
     cwd: str | Path | None = None,
     config: Dict[str, Any] | None = None,
 ) -> List[SkillSearchRoot]:
     roots: List[SkillSearchRoot] = []
 
-    repo_root, project_roots = _discover_project_local_roots(cwd)
-    if project_roots and _project_locals_allowed(
-        repo_root,
-        config=config,
-        allow_prompt=allow_project_prompt,
-        approval_callback=approval_callback,
-    ):
+    _, project_roots = _discover_project_local_roots(cwd)
+    if project_roots and _project_local_enabled(config):
         roots.extend(project_roots)
 
     roots.append(SkillSearchRoot(path=_current_skills_dir(), scope="user"))
@@ -565,15 +382,11 @@ def _build_skill_catalog(roots: tuple[SkillSearchRoot, ...]) -> SkillCatalog:
 
 def _get_skill_catalog(
     *,
-    allow_project_prompt: bool = False,
-    approval_callback=None,
     cwd: str | Path | None = None,
     config: Dict[str, Any] | None = None,
 ) -> SkillCatalog:
     roots = tuple(
         _skill_search_roots(
-            allow_project_prompt=allow_project_prompt,
-            approval_callback=approval_callback,
             cwd=cwd,
             config=config,
         )
@@ -1025,8 +838,6 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
 def _find_all_skills(
     *,
     skip_disabled: bool = False,
-    allow_project_prompt: bool = False,
-    approval_callback=None,
 ) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/.
 
@@ -1038,10 +849,7 @@ def _find_all_skills(
     Returns:
         List of skill metadata dicts (name, description, category).
     """
-    catalog = _get_skill_catalog(
-        allow_project_prompt=allow_project_prompt,
-        approval_callback=approval_callback,
-    )
+    catalog = _get_skill_catalog()
 
     disabled = set() if skip_disabled else _get_disabled_skill_names()
     return [
@@ -1282,8 +1090,8 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
                     {
                         "success": False,
                         "error": (
-                            "Project-local skills for this repository are not approved yet. "
-                            "Add the repo root to skills.project_local.trusted_projects to allow them."
+                            "Project-local skills are disabled. "
+                            "Set skills.project_local: true in config.yaml to allow them."
                         ),
                     },
                     ensure_ascii=False,

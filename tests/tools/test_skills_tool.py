@@ -218,7 +218,7 @@ class TestFindAllSkills:
         assert "skill-a" in names
         assert "skill-b" in names
 
-    def test_project_local_skills_hidden_until_approved(self, tmp_path, monkeypatch):
+    def test_project_local_skills_hidden_by_default(self, tmp_path, monkeypatch):
         user_skills = tmp_path / "user-skills"
         repo_root = tmp_path / "repo"
         local_skills = repo_root / ".agents" / "skills"
@@ -227,15 +227,25 @@ class TestFindAllSkills:
 
         with patch("tools.skills_tool.SKILLS_DIR", user_skills):
             hidden = _find_all_skills()
-            visible = _find_all_skills(
-                allow_project_prompt=True,
-                approval_callback=lambda *_args, **_kwargs: "session",
-            )
 
         assert hidden == []
+
+    def test_project_local_skills_visible_when_enabled(self, tmp_path, monkeypatch):
+        user_skills = tmp_path / "user-skills"
+        repo_root = tmp_path / "repo"
+        local_skills = repo_root / ".agents" / "skills"
+        _make_skill(local_skills, "project-only")
+        monkeypatch.setenv("TERMINAL_CWD", str(repo_root))
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", user_skills),
+            patch("hermes_cli.config.load_config", return_value={"skills": {"project_local": True}}),
+        ):
+            visible = _find_all_skills()
+
         assert [skill["name"] for skill in visible] == ["project-only"]
 
-    def test_project_local_skill_shadows_user_skill_after_approval(
+    def test_project_local_skill_shadows_user_skill_when_enabled(
         self, tmp_path, monkeypatch
     ):
         user_skills = tmp_path / "user-skills"
@@ -245,11 +255,11 @@ class TestFindAllSkills:
         _make_skill(local_skills, "shadowed", body="Use the repo skill.")
         monkeypatch.setenv("TERMINAL_CWD", str(repo_root))
 
-        with patch("tools.skills_tool.SKILLS_DIR", user_skills):
-            skills = _find_all_skills(
-                allow_project_prompt=True,
-                approval_callback=lambda *_args, **_kwargs: "session",
-            )
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", user_skills),
+            patch("hermes_cli.config.load_config", return_value={"skills": {"project_local": True}}),
+        ):
+            skills = _find_all_skills()
 
         assert len(skills) == 1
         assert skills[0]["name"] == "shadowed"
@@ -440,7 +450,7 @@ class TestSkillView:
         result = json.loads(raw)
         assert result["success"] is True
 
-    def test_view_blocks_unapproved_project_local_skill_by_absolute_path(
+    def test_view_blocks_project_local_skill_when_disabled(
         self, tmp_path, monkeypatch
     ):
         user_skills = tmp_path / "user-skills"
@@ -453,7 +463,8 @@ class TestSkillView:
 
         result = json.loads(raw)
         assert result["success"] is False
-        assert "not approved" in result["error"].lower()
+        assert "disabled" in result["error"].lower()
+        assert "skills.project_local" in result["error"]
 
 
 class TestSkillViewSecureSetupOnLoad:
