@@ -87,6 +87,7 @@ def check_skill_manage_requirements() -> bool:
     """Skill management has no external requirements -- always available."""
     return True
 
+
 # =============================================================================
 # Validation helpers
 # =============================================================================
