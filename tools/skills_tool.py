@@ -150,8 +150,6 @@ def set_secret_capture_callback(callback) -> None:
 
 
 def _normalize_project_key(path: Path | str) -> str:
-    if not isinstance(path, (str, Path, os.PathLike)):
-        return os.path.normcase(str(path))
     candidate = Path(path).expanduser()
     try:
         resolved = candidate.resolve()
@@ -196,7 +194,12 @@ def _project_local_enabled(config: Dict[str, Any] | None = None) -> bool:
             from hermes_cli.config import load_config
 
             config = load_config()
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Failed to load Hermes config for project-local skills check: %s",
+                exc,
+                exc_info=True,
+            )
             config = {}
 
     skills_cfg = config.get("skills", {}) if isinstance(config, dict) else {}

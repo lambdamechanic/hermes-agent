@@ -333,7 +333,12 @@ def build_skills_system_prompt(
 
         disabled = _get_disabled_skill_names()
         catalog = _get_skill_catalog()
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Failed to load skill catalog; skills will be unavailable: %s",
+            exc,
+            exc_info=True,
+        )
         disabled = set()
         catalog = None
 

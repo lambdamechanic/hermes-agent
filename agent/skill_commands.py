@@ -70,7 +70,7 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
     if skill_dir_value:
         try:
             skill_dir = Path(skill_dir_value)
-        except Exception:
+        except ValueError:
             skill_dir = None
     elif loaded_skill.get("path"):
         skill_path = str(loaded_skill.get("path") or "")
@@ -183,8 +183,8 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                 "skill_md_path": str(entry.skill_md),
                 "skill_dir": str(entry.skill_dir) if entry.skill_dir else "",
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error("Failed to scan for skill commands: %s", exc, exc_info=True)
     return _skill_commands
 
 
