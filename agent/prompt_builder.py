@@ -320,44 +320,52 @@ def build_skills_system_prompt(
     match skills by meaning, not just name.
     Filters out skills incompatible with the current OS platform.
     """
-    hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
-    skills_dir = hermes_home / "skills"
-
-    if not skills_dir.exists():
-        return ""
-
     # Collect skills with descriptions, grouped by category.
     # Each entry: (skill_name, description)
     # Supports sub-categories: skills/mlops/training/axolotl/SKILL.md
     # -> category "mlops/training", skill "axolotl"
     # Load disabled skill names once for the entire scan
     try:
-        from tools.skills_tool import _get_disabled_skill_names
+        from tools.skills_tool import (
+            _get_disabled_skill_names,
+            _get_skill_catalog,
+        )
+
         disabled = _get_disabled_skill_names()
-    except Exception:
+        catalog = _get_skill_catalog()
+    except Exception as exc:
+        logger.warning(
+            "Failed to load skill catalog; skills will be unavailable: %s",
+            exc,
+            exc_info=True,
+        )
         disabled = set()
+        catalog = None
+
+    if catalog is None or not any(root.path.exists() for root in catalog.roots):
+        return ""
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
-    for skill_file in skills_dir.rglob("SKILL.md"):
-        is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
-        if not is_compatible:
-            continue
-        rel_path = skill_file.relative_to(skills_dir)
-        parts = rel_path.parts
+    root_by_category: dict[str, Path] = {}
+    for entry in catalog.visible_entries:
+        parts = Path(entry.relative_path).parts
         if len(parts) >= 2:
             skill_name = parts[-2]
             category = "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
         else:
             category = "general"
-            skill_name = skill_file.parent.name
-        # Respect user's disabled skills config
-        fm_name = frontmatter.get("name", skill_name)
+            skill_name = entry.skill_dir.name if entry.skill_dir is not None else entry.name
+
+        fm_name = entry.frontmatter.get("name", skill_name)
         if fm_name in disabled or skill_name in disabled:
             continue
-        # Skip skills whose conditional activation rules exclude them
-        conditions = _read_skill_conditions(skill_file)
-        if not _skill_should_show(conditions, available_tools, available_toolsets):
+        if not _skill_should_show(entry.conditions, available_tools, available_toolsets):
             continue
+
+        desc = entry.description
+        if len(desc) > 60:
+            desc = desc[:57] + "..."
+        root_by_category.setdefault(category, entry.root_path)
         skills_by_category.setdefault(category, []).append((skill_name, desc))
 
     if not skills_by_category:
@@ -368,7 +376,10 @@ def build_skills_system_prompt(
     category_descriptions = {}
     for category in skills_by_category:
         cat_path = Path(category)
-        desc_file = skills_dir / cat_path / "DESCRIPTION.md"
+        root_path = root_by_category.get(category)
+        if root_path is None:
+            continue
+        desc_file = root_path / cat_path / "DESCRIPTION.md"
         if desc_file.exists():
             try:
                 content = desc_file.read_text(encoding="utf-8")

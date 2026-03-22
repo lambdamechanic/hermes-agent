@@ -100,7 +100,6 @@ class TestScanSkillCommands:
         assert "/enabled-skill" in result
         assert "/disabled-skill" not in result
 
-
 class TestBuildPreloadedSkillsPrompt:
     def test_builds_prompt_for_multiple_named_skills(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
