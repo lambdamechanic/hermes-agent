@@ -394,7 +394,6 @@ class TestBuildSkillsSystemPrompt:
         result = build_skills_system_prompt()
         assert "backend-skill" in result
 
-
 # =========================================================================
 # Context files prompt builder
 # =========================================================================

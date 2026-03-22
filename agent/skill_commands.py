@@ -65,9 +65,15 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         return None
 
     skill_name = str(loaded_skill.get("name") or normalized)
-    skill_path = str(loaded_skill.get("path") or "")
     skill_dir = None
-    if skill_path:
+    skill_dir_value = str(loaded_skill.get("skill_dir") or "")
+    if skill_dir_value:
+        try:
+            skill_dir = Path(skill_dir_value)
+        except Exception:
+            skill_dir = None
+    elif loaded_skill.get("path"):
+        skill_path = str(loaded_skill.get("path") or "")
         try:
             skill_dir = SKILLS_DIR / Path(skill_path).parent
         except Exception:
@@ -84,8 +90,6 @@ def _build_skill_message(
     runtime_note: str = "",
 ) -> str:
     """Format a loaded skill into a user/system message payload."""
-    from tools.skills_tool import SKILLS_DIR
-
     content = str(loaded_skill.get("content") or "")
 
     parts = [activation_note, "", content.strip()]
@@ -128,7 +132,7 @@ def _build_skill_message(
                         supporting.append(rel)
 
     if supporting and skill_dir:
-        skill_view_target = str(skill_dir.relative_to(SKILLS_DIR))
+        skill_view_target = str(loaded_skill.get("skill_dir") or skill_dir)
         parts.append("")
         parts.append("[This skill has supporting files you can load with the skill_view tool:]")
         for sf in supporting:
@@ -157,39 +161,28 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     global _skill_commands
     _skill_commands = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, _get_disabled_skill_names
-        if not SKILLS_DIR.exists():
-            return _skill_commands
+        from tools.skills_tool import (
+            _get_disabled_skill_names,
+            _get_skill_catalog,
+        )
+
         disabled = _get_disabled_skill_names()
-        for skill_md in SKILLS_DIR.rglob("SKILL.md"):
-            if any(part in ('.git', '.github', '.hub') for part in skill_md.parts):
+        catalog = _get_skill_catalog()
+        for entry in catalog.visible_entries:
+            name = entry.name
+            if name in disabled:
                 continue
-            try:
-                content = skill_md.read_text(encoding='utf-8')
-                frontmatter, body = _parse_frontmatter(content)
-                # Skip skills incompatible with the current OS platform
-                if not skill_matches_platform(frontmatter):
-                    continue
-                name = frontmatter.get('name', skill_md.parent.name)
-                # Respect user's disabled skills config
-                if name in disabled:
-                    continue
-                description = frontmatter.get('description', '')
-                if not description:
-                    for line in body.strip().split('\n'):
-                        line = line.strip()
-                        if line and not line.startswith('#'):
-                            description = line[:80]
-                            break
-                cmd_name = name.lower().replace(' ', '-').replace('_', '-')
-                _skill_commands[f"/{cmd_name}"] = {
-                    "name": name,
-                    "description": description or f"Invoke the {name} skill",
-                    "skill_md_path": str(skill_md),
-                    "skill_dir": str(skill_md.parent),
-                }
-            except Exception:
+            description = entry.description[:80] if entry.description else ""
+            cmd_name = name.lower().replace(" ", "-").replace("_", "-")
+            cmd_key = f"/{cmd_name}"
+            if cmd_key in _skill_commands:
                 continue
+            _skill_commands[cmd_key] = {
+                "name": name,
+                "description": description or f"Invoke the {name} skill",
+                "skill_md_path": str(entry.skill_md),
+                "skill_dir": str(entry.skill_dir) if entry.skill_dir else "",
+            }
     except Exception:
         pass
     return _skill_commands

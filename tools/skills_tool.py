@@ -71,6 +71,8 @@ import logging
 import os
 import re
 import sys
+import threading
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
@@ -87,6 +89,8 @@ logger = logging.getLogger(__name__)
 # skills all coexist here without polluting the git repo.
 HERMES_HOME = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 SKILLS_DIR = HERMES_HOME / "skills"
+_DEFAULT_HERMES_HOME = HERMES_HOME
+_DEFAULT_SKILLS_DIR = SKILLS_DIR
 
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
@@ -100,8 +104,43 @@ _PLATFORM_MAP = {
     "windows": "win32",
 }
 _EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub"))
+_PROJECT_LOCAL_SKILL_DIRS = (".hermes/skills", ".agents/skills")
 _REMOTE_ENV_BACKENDS = frozenset({"docker", "singularity", "modal", "ssh", "daytona"})
 _secret_capture_callback = None
+_project_local_lock = threading.Lock()
+_session_trusted_projects: Set[str] = set()
+_session_denied_projects: Set[str] = set()
+
+
+@dataclass(frozen=True)
+class SkillSearchRoot:
+    path: Path
+    scope: str
+    project_root: Path | None = None
+
+
+@dataclass(frozen=True)
+class SkillCatalogEntry:
+    name: str
+    description: str
+    skill_md: Path
+    skill_dir: Path | None
+    root_path: Path
+    scope: str
+    category: str | None
+    relative_path: str
+    frontmatter: Dict[str, Any]
+    conditions: Dict[str, List[str]]
+
+
+@dataclass(frozen=True)
+class SkillCatalog:
+    roots: tuple[SkillSearchRoot, ...]
+    entries: tuple[SkillCatalogEntry, ...]
+    visible_entries: tuple[SkillCatalogEntry, ...]
+    entries_by_name: Dict[str, SkillCatalogEntry]
+    entries_by_skill_md: Dict[str, SkillCatalogEntry]
+    category_dirs: Dict[str, Path]
 
 
 class SkillReadinessStatus(str, Enum):
@@ -113,6 +152,433 @@ class SkillReadinessStatus(str, Enum):
 def set_secret_capture_callback(callback) -> None:
     global _secret_capture_callback
     _secret_capture_callback = callback
+
+
+def _normalize_project_key(path: Path | str) -> str:
+    if not isinstance(path, (str, Path, os.PathLike)):
+        return os.path.normcase(str(path))
+    candidate = Path(path).expanduser()
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        resolved = candidate.absolute()
+    return os.path.normcase(str(resolved))
+
+
+def _find_git_root(start: Path) -> Optional[Path]:
+    try:
+        current = start.resolve()
+    except Exception:
+        current = start.absolute()
+    for parent in [current, *current.parents]:
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def _skill_discovery_cwd(cwd: str | Path | None = None) -> Path:
+    raw = cwd or os.getenv("TERMINAL_CWD") or os.getcwd()
+    return Path(raw).expanduser()
+
+
+def _current_skills_dir() -> Path:
+    """Return the current user-skill root.
+
+    Tests often monkeypatch ``SKILLS_DIR`` directly. Outside of that, respect a
+    late-bound ``HERMES_HOME`` env var so prompt-building and discovery stay in
+    sync with the active environment rather than the import-time default.
+    """
+    if not isinstance(SKILLS_DIR, (Path, str, os.PathLike)):
+        return SKILLS_DIR
+    if _normalize_project_key(SKILLS_DIR) != _normalize_project_key(_DEFAULT_SKILLS_DIR):
+        return SKILLS_DIR
+    return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "skills"
+
+
+def _project_local_config(config: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
+
+    skills_cfg = config.get("skills", {}) if isinstance(config, dict) else {}
+    project_local = skills_cfg.get("project_local", {})
+    if not isinstance(project_local, dict):
+        project_local = {}
+
+    trusted_projects = project_local.get("trusted_projects", [])
+    if not isinstance(trusted_projects, list):
+        trusted_projects = []
+
+    return {
+        "enabled": bool(project_local.get("enabled", True)),
+        "trusted_projects": {_normalize_project_key(p) for p in trusted_projects if str(p).strip()},
+    }
+
+
+def _discover_project_local_roots(
+    cwd: str | Path | None = None,
+) -> tuple[Path, List[SkillSearchRoot]]:
+    cwd_path = _skill_discovery_cwd(cwd)
+    repo_root = _find_git_root(cwd_path) or cwd_path
+    try:
+        repo_root = repo_root.resolve()
+    except Exception:
+        repo_root = repo_root.absolute()
+
+    roots: List[SkillSearchRoot] = []
+    for relative_dir in _PROJECT_LOCAL_SKILL_DIRS:
+        candidate = repo_root / relative_dir
+        if candidate.is_dir():
+            roots.append(
+                SkillSearchRoot(
+                    path=candidate.resolve(),
+                    scope="project_local",
+                    project_root=repo_root,
+                )
+            )
+    return repo_root, roots
+
+
+def _scan_root_skill_names(root: SkillSearchRoot | Path) -> List[str]:
+    names: List[str] = []
+    seen: Set[str] = set()
+
+    if not isinstance(root, SkillSearchRoot):
+        inferred_scope = (
+            "user"
+            if _normalize_project_key(root) == _normalize_project_key(_current_skills_dir())
+            else "project_local"
+        )
+        root = SkillSearchRoot(path=Path(root), scope=inferred_scope)
+
+    for entry in _scan_skill_root(root):
+        if entry.name in seen:
+            continue
+        seen.add(entry.name)
+        names.append(entry.name)
+
+    return names
+
+
+def _build_project_local_approval_prompt(
+    repo_root: Path,
+    project_roots: List[SkillSearchRoot],
+) -> tuple[str, str]:
+    skill_names: List[str] = []
+    for root in project_roots:
+        skill_names.extend(_scan_root_skill_names(root))
+    skill_names = sorted(set(skill_names))
+
+    shadowed: List[str] = []
+    builtin_conflicts: List[str] = []
+    user_skills_dir = _current_skills_dir()
+    if skill_names and user_skills_dir.is_dir():
+        existing = set(
+            _scan_root_skill_names(SkillSearchRoot(path=user_skills_dir, scope="user"))
+        )
+        shadowed = [name for name in skill_names if name in existing]
+
+    try:
+        from hermes_cli.commands import COMMANDS as _BUILTIN_COMMANDS
+
+        builtins = set(_BUILTIN_COMMANDS)
+        builtin_conflicts = [
+            f"/{name.lower().replace(' ', '-').replace('_', '-')}"
+            for name in skill_names
+            if f"/{name.lower().replace(' ', '-').replace('_', '-')}" in builtins
+        ]
+    except Exception:
+        builtin_conflicts = []
+
+    rel_roots = []
+    for root in project_roots:
+        try:
+            rel_roots.append(str(root.path.relative_to(repo_root)))
+        except Exception:
+            rel_roots.append(str(root.path))
+
+    description_parts = [
+        f"Trust project-local skills from {repo_root}?",
+        f"Found {len(skill_names)} skill(s) in {', '.join(rel_roots)}.",
+    ]
+    if shadowed:
+        preview = ", ".join(shadowed[:5])
+        if len(shadowed) > 5:
+            preview += ", ..."
+        description_parts.append(
+            f"{len(shadowed)} would shadow existing installed skill(s): {preview}."
+        )
+    if builtin_conflicts:
+        preview = ", ".join(builtin_conflicts[:5])
+        if len(builtin_conflicts) > 5:
+            preview += ", ..."
+        description_parts.append(
+            f"{len(builtin_conflicts)} would reuse existing slash command name(s): {preview}."
+        )
+
+    return (
+        f"project-local skills from {repo_root}",
+        " ".join(part for part in description_parts if part),
+    )
+
+
+def _project_locals_allowed(
+    repo_root: Path,
+    *,
+    config: Dict[str, Any] | None = None,
+    allow_prompt: bool = False,
+    approval_callback=None,
+) -> bool:
+    settings = _project_local_config(config)
+    if not settings["enabled"]:
+        return False
+
+    repo_key = _normalize_project_key(repo_root)
+    with _project_local_lock:
+        if repo_key in _session_trusted_projects:
+            return True
+        if repo_key in _session_denied_projects:
+            return False
+
+    if repo_key in settings["trusted_projects"]:
+        with _project_local_lock:
+            _session_trusted_projects.add(repo_key)
+        return True
+
+    if not allow_prompt or approval_callback is None:
+        return False
+
+    _, project_roots = _discover_project_local_roots(repo_root)
+    if not project_roots:
+        return False
+
+    subject, description = _build_project_local_approval_prompt(
+        repo_root,
+        project_roots,
+    )
+    try:
+        choice = approval_callback(subject, description, allow_permanent=True)
+    except TypeError:
+        choice = approval_callback(subject, description)
+    except Exception:
+        choice = "deny"
+
+    if choice in {"once", "session", "always"}:
+        with _project_local_lock:
+            # Treat "once" as a transient in-process trust decision so the user
+            # isn't reprompted when the skill catalog is rebuilt during the same
+            # interactive session.
+            _session_trusted_projects.add(repo_key)
+            _session_denied_projects.discard(repo_key)
+        if choice == "always":
+            try:
+                from hermes_cli.config import load_config, save_config
+
+                config_data = load_config()
+                skills_cfg = config_data.setdefault("skills", {})
+                project_local_cfg = skills_cfg.setdefault("project_local", {})
+                trusted = project_local_cfg.setdefault("trusted_projects", [])
+                trusted_keys = {
+                    _normalize_project_key(item) for item in trusted if str(item).strip()
+                }
+                if repo_key not in trusted_keys:
+                    trusted.append(str(repo_root))
+                    project_local_cfg["trusted_projects"] = sorted(
+                        trusted,
+                        key=lambda item: _normalize_project_key(item),
+                    )
+                    save_config(config_data)
+            except Exception:
+                logger.debug(
+                    "Could not persist trusted project-local skill approval for %s",
+                    repo_root,
+                    exc_info=True,
+                )
+        return True
+
+    with _project_local_lock:
+        _session_denied_projects.add(repo_key)
+    return False
+
+
+def _skill_search_roots(
+    *,
+    allow_project_prompt: bool = False,
+    approval_callback=None,
+    cwd: str | Path | None = None,
+    config: Dict[str, Any] | None = None,
+) -> List[SkillSearchRoot]:
+    roots: List[SkillSearchRoot] = []
+
+    repo_root, project_roots = _discover_project_local_roots(cwd)
+    if project_roots and _project_locals_allowed(
+        repo_root,
+        config=config,
+        allow_prompt=allow_project_prompt,
+        approval_callback=approval_callback,
+    ):
+        roots.extend(project_roots)
+
+    roots.append(SkillSearchRoot(path=_current_skills_dir(), scope="user"))
+    return roots
+
+
+def _path_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _path_within_any_root(path: Path, roots: List[SkillSearchRoot]) -> bool:
+    return any(_path_within_root(path, root.path) for root in roots)
+
+def _skill_conditions_from_frontmatter(frontmatter: Dict[str, Any]) -> Dict[str, List[str]]:
+    metadata = frontmatter.get("metadata")
+    hermes = {}
+    if isinstance(metadata, dict):
+        hermes = metadata.get("hermes", {}) or {}
+    if not isinstance(hermes, dict):
+        hermes = {}
+
+    def _normalize(value: Any) -> List[str]:
+        if not value:
+            return []
+        if not isinstance(value, list):
+            value = [value]
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    return {
+        "fallback_for_toolsets": _normalize(hermes.get("fallback_for_toolsets")),
+        "requires_toolsets": _normalize(hermes.get("requires_toolsets")),
+        "fallback_for_tools": _normalize(hermes.get("fallback_for_tools")),
+        "requires_tools": _normalize(hermes.get("requires_tools")),
+    }
+
+
+def _skill_description_from_frontmatter(
+    frontmatter: Dict[str, Any],
+    body: str,
+    *,
+    max_length: int = MAX_DESCRIPTION_LENGTH,
+) -> str:
+    description = str(frontmatter.get("description", "") or "").strip()
+    if not description:
+        for line in body.strip().split("\n"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                description = line
+                break
+
+    if len(description) > max_length:
+        return description[: max_length - 3] + "..."
+    return description
+
+
+def _scan_skill_root(root: SkillSearchRoot) -> tuple[SkillCatalogEntry, ...]:
+    entries: List[SkillCatalogEntry] = []
+    if root.path.exists():
+        for skill_md in root.path.rglob("SKILL.md"):
+            if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+                continue
+
+            skill_dir = skill_md.parent
+            try:
+                raw = skill_md.read_text(encoding="utf-8")[:4000]
+                frontmatter, body = _parse_frontmatter(raw)
+                if not skill_matches_platform(frontmatter):
+                    continue
+
+                name = str(frontmatter.get("name", skill_dir.name)).strip()[:MAX_NAME_LENGTH]
+                if not name:
+                    continue
+
+                try:
+                    relative_path = str(skill_md.relative_to(root.path))
+                except Exception:
+                    relative_path = str(skill_md)
+
+                entries.append(
+                    SkillCatalogEntry(
+                        name=name,
+                        description=_skill_description_from_frontmatter(frontmatter, body),
+                        skill_md=skill_md,
+                        skill_dir=skill_dir,
+                        root_path=root.path,
+                        scope=root.scope,
+                        category=_get_category_from_path(skill_md, root.path),
+                        relative_path=relative_path,
+                        frontmatter=frontmatter,
+                        conditions=_skill_conditions_from_frontmatter(frontmatter),
+                    )
+                )
+            except (UnicodeDecodeError, PermissionError) as e:
+                logger.debug("Failed to read skill file %s: %s", skill_md, e)
+                continue
+            except Exception as e:
+                logger.debug(
+                    "Skipping skill at %s: failed to parse: %s",
+                    skill_md,
+                    e,
+                    exc_info=True,
+                )
+                continue
+
+    return tuple(entries)
+
+
+def _build_skill_catalog(roots: tuple[SkillSearchRoot, ...]) -> SkillCatalog:
+    entries: List[SkillCatalogEntry] = []
+    visible_entries: List[SkillCatalogEntry] = []
+    entries_by_name: Dict[str, SkillCatalogEntry] = {}
+    entries_by_skill_md: Dict[str, SkillCatalogEntry] = {}
+    category_dirs: Dict[str, Path] = {}
+    seen_names: Set[str] = set()
+
+    for root in roots:
+        root_entries = _scan_skill_root(root)
+        entries.extend(root_entries)
+        for entry in root_entries:
+            entries_by_skill_md[_normalize_project_key(entry.skill_md)] = entry
+            if entry.name in seen_names:
+                continue
+            seen_names.add(entry.name)
+            visible_entries.append(entry)
+            entries_by_name[entry.name] = entry
+            if entry.category and entry.category not in category_dirs:
+                category_dirs[entry.category] = entry.root_path / entry.category
+
+    return SkillCatalog(
+        roots=roots,
+        entries=tuple(entries),
+        visible_entries=tuple(visible_entries),
+        entries_by_name=entries_by_name,
+        entries_by_skill_md=entries_by_skill_md,
+        category_dirs=category_dirs,
+    )
+
+
+def _get_skill_catalog(
+    *,
+    allow_project_prompt: bool = False,
+    approval_callback=None,
+    cwd: str | Path | None = None,
+    config: Dict[str, Any] | None = None,
+) -> SkillCatalog:
+    roots = tuple(
+        _skill_search_roots(
+            allow_project_prompt=allow_project_prompt,
+            approval_callback=approval_callback,
+            cwd=cwd,
+            config=config,
+        )
+    )
+    return _build_skill_catalog(roots)
 
 
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
@@ -453,19 +919,24 @@ def _parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     return frontmatter, body
 
 
-def _get_category_from_path(skill_path: Path) -> Optional[str]:
+def _get_category_from_path(
+    skill_path: Path,
+    root_dir: Path | None = None,
+) -> Optional[str]:
     """
     Extract category from skill path based on directory structure.
 
     For paths like: ~/.hermes/skills/mlops/axolotl/SKILL.md -> "mlops"
     """
     try:
-        rel_path = skill_path.relative_to(SKILLS_DIR)
+        if root_dir is None:
+            root_dir = _current_skills_dir()
+        rel_path = skill_path.relative_to(root_dir)
         parts = rel_path.parts
         if len(parts) >= 3:
             return parts[0]
         return None
-    except ValueError:
+    except Exception:
         return None
 
 
@@ -551,7 +1022,12 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _find_all_skills(
+    *,
+    skip_disabled: bool = False,
+    allow_project_prompt: bool = False,
+    approval_callback=None,
+) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/.
 
     Args:
@@ -562,61 +1038,22 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     Returns:
         List of skill metadata dicts (name, description, category).
     """
-    skills = []
+    catalog = _get_skill_catalog(
+        allow_project_prompt=allow_project_prompt,
+        approval_callback=approval_callback,
+    )
 
-    if not SKILLS_DIR.exists():
-        return skills
-
-    # Load disabled set once (not per-skill)
     disabled = set() if skip_disabled else _get_disabled_skill_names()
-
-
-    for skill_md in SKILLS_DIR.rglob("SKILL.md"):
-        if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
-            continue
-
-        skill_dir = skill_md.parent
-
-        try:
-            content = skill_md.read_text(encoding="utf-8")[:4000]
-            frontmatter, body = _parse_frontmatter(content)
-
-            if not skill_matches_platform(frontmatter):
-                continue
-
-            name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
-            if name in disabled:
-                continue
-
-            description = frontmatter.get("description", "")
-            if not description:
-                for line in body.strip().split("\n"):
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        description = line
-                        break
-
-            if len(description) > MAX_DESCRIPTION_LENGTH:
-                description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
-
-            category = _get_category_from_path(skill_md)
-
-            skills.append({
-                "name": name,
-                "description": description,
-                "category": category,
-            })
-
-        except (UnicodeDecodeError, PermissionError) as e:
-            logger.debug("Failed to read skill file %s: %s", skill_md, e)
-            continue
-        except Exception as e:
-            logger.debug(
-                "Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True
-            )
-            continue
-
-    return skills
+    return [
+        {
+            "name": entry.name,
+            "description": entry.description,
+            "category": entry.category,
+            "scope": entry.scope,
+        }
+        for entry in catalog.visible_entries
+        if entry.name not in disabled
+    ]
 
 
 def _load_category_description(category_dir: Path) -> Optional[str]:
@@ -678,7 +1115,8 @@ def skills_categories(verbose: bool = False, task_id: str = None) -> str:
         JSON string with list of categories and their descriptions
     """
     try:
-        if not SKILLS_DIR.exists():
+        catalog = _get_skill_catalog()
+        if not any(root.path.exists() for root in catalog.roots):
             return json.dumps(
                 {
                     "success": True,
@@ -690,25 +1128,13 @@ def skills_categories(verbose: bool = False, task_id: str = None) -> str:
 
         category_dirs = {}
         category_counts: Dict[str, int] = {}
-        for skill_md in SKILLS_DIR.rglob("SKILL.md"):
-            if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
-                continue
-
-            try:
-                frontmatter, _ = _parse_frontmatter(
-                    skill_md.read_text(encoding="utf-8")[:4000]
+        for entry in catalog.visible_entries:
+            if entry.category:
+                category_counts[entry.category] = category_counts.get(entry.category, 0) + 1
+                category_dirs.setdefault(
+                    entry.category,
+                    catalog.category_dirs.get(entry.category, entry.root_path / entry.category),
                 )
-            except Exception:
-                frontmatter = {}
-
-            if not skill_matches_platform(frontmatter):
-                continue
-
-            category = _get_category_from_path(skill_md)
-            if category:
-                category_counts[category] = category_counts.get(category, 0) + 1
-                if category not in category_dirs:
-                    category_dirs[category] = SKILLS_DIR / category
 
         categories = []
         for name in sorted(category_dirs.keys()):
@@ -748,8 +1174,9 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         JSON string with minimal skill info: name, description, category
     """
     try:
-        if not SKILLS_DIR.exists():
-            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        catalog = _get_skill_catalog()
+        if not any(root.path.exists() for root in catalog.roots):
+            _current_skills_dir().mkdir(parents=True, exist_ok=True)
             return json.dumps(
                 {
                     "success": True,
@@ -814,7 +1241,12 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
         JSON string with skill content or error message
     """
     try:
-        if not SKILLS_DIR.exists():
+        catalog = _get_skill_catalog()
+        allowed_roots = list(catalog.roots)
+        _, project_roots = _discover_project_local_roots()
+        all_roots = [*project_roots, SkillSearchRoot(path=_current_skills_dir(), scope="user")]
+
+        if not any(root.path.exists() for root in all_roots):
             return json.dumps(
                 {
                     "success": False,
@@ -825,28 +1257,69 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
 
         skill_dir = None
         skill_md = None
+        catalog_entry: SkillCatalogEntry | None = None
 
-        # Try direct path first (e.g., "mlops/axolotl")
-        direct_path = SKILLS_DIR / name
-        if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
-            skill_dir = direct_path
-            skill_md = direct_path / "SKILL.md"
-        elif direct_path.with_suffix(".md").exists():
-            skill_md = direct_path.with_suffix(".md")
+        identifier_path = Path(name).expanduser()
+        search_by_name = not identifier_path.is_absolute()
+        direct_candidates: List[Path] = []
+        if identifier_path.is_absolute():
+            direct_candidates.append(identifier_path)
+        else:
+            direct_candidates.extend(root.path / name for root in allowed_roots)
 
-        # Search by directory name
-        if not skill_md:
-            for found_skill_md in SKILLS_DIR.rglob("SKILL.md"):
-                if found_skill_md.parent.name == name:
-                    skill_dir = found_skill_md.parent
-                    skill_md = found_skill_md
-                    break
+        for direct_path in direct_candidates:
+            if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
+                skill_dir = direct_path
+                skill_md = direct_path / "SKILL.md"
+                break
+            if direct_path.with_suffix(".md").exists():
+                skill_md = direct_path.with_suffix(".md")
+                break
 
-        # Legacy: flat .md files
-        if not skill_md:
-            for found_md in SKILLS_DIR.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md":
-                    skill_md = found_md
+        if skill_md and project_roots and _path_within_any_root(skill_md, project_roots):
+            if not _path_within_any_root(skill_md, allowed_roots):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "Project-local skills for this repository are not approved yet. "
+                            "Add the repo root to skills.project_local.trusted_projects to allow them."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
+        if skill_md:
+            catalog_entry = catalog.entries_by_skill_md.get(
+                _normalize_project_key(skill_md)
+            )
+            if catalog_entry and catalog_entry.skill_dir is not None:
+                skill_dir = catalog_entry.skill_dir
+
+        # Search by directory name within approved roots only
+        if not skill_md and search_by_name:
+            catalog_entry = next(
+                (
+                    entry
+                    for entry in catalog.visible_entries
+                    if entry.skill_dir is not None and entry.skill_dir.name == name
+                ),
+                None,
+            )
+            if catalog_entry is not None:
+                skill_dir = catalog_entry.skill_dir
+                skill_md = catalog_entry.skill_md
+
+        # Legacy: flat .md files within approved roots only
+        if not skill_md and search_by_name:
+            for root in allowed_roots:
+                if not root.path.exists():
+                    continue
+                for found_md in root.path.rglob(f"{name}.md"):
+                    if found_md.name != "SKILL.md":
+                        skill_md = found_md
+                        break
+                if skill_md:
                     break
 
         if not skill_md or not skill_md.exists():
@@ -874,11 +1347,7 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             )
 
         # Security: warn if skill is loaded from outside the trusted skills directory
-        try:
-            skill_md.resolve().relative_to(SKILLS_DIR.resolve())
-            _outside_skills_dir = False
-        except ValueError:
-            _outside_skills_dir = True
+        _outside_skills_dir = not _path_within_any_root(skill_md, allowed_roots)
 
         # Security: detect common prompt injection patterns
         _INJECTION_PATTERNS = [
@@ -898,7 +1367,10 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
         if _outside_skills_dir or _injection_detected:
             _warnings = []
             if _outside_skills_dir:
-                _warnings.append(f"skill file is outside the trusted skills directory (~/.hermes/skills/): {skill_md}")
+                _warnings.append(
+                    "skill file is outside the approved skill roots "
+                    f"(~/.hermes/skills or approved project-local roots): {skill_md}"
+                )
             if _injection_detected:
                 _warnings.append("skill content contains patterns that may indicate prompt injection")
             import logging as _logging
@@ -1116,7 +1588,25 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
         if script_files:
             linked_files["scripts"] = script_files
 
-        rel_path = str(skill_md.relative_to(SKILLS_DIR))
+        root_for_skill = None
+        if catalog_entry is not None:
+            root_for_skill = SkillSearchRoot(
+                path=catalog_entry.root_path,
+                scope=catalog_entry.scope,
+            )
+        if root_for_skill is None:
+            root_for_skill = next(
+                (root for root in allowed_roots if _path_within_root(skill_md, root.path)),
+                None,
+            )
+        try:
+            rel_path = (
+                str(skill_md.relative_to(root_for_skill.path))
+                if root_for_skill is not None
+                else str(skill_md)
+            )
+        except Exception:
+            rel_path = str(skill_md)
         skill_name = frontmatter.get(
             "name", skill_md.stem if not skill_dir else skill_dir.name
         )
@@ -1154,6 +1644,8 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             "related_skills": related_skills,
             "content": content,
             "path": rel_path,
+            "skill_dir": str(skill_dir) if skill_dir else None,
+            "source_scope": root_for_skill.scope if root_for_skill else "external",
             "linked_files": linked_files if linked_files else None,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
             if linked_files

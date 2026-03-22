@@ -21,6 +21,7 @@ from tools.skill_manager_tool import (
     ALLOWED_SUBDIRS,
     MAX_NAME_LENGTH,
 )
+from tools.skills_tool import skills_list
 
 
 VALID_SKILL_CONTENT = """\
@@ -190,6 +191,22 @@ class TestCreateSkill:
         with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path):
             result = _create_skill("my-skill", "no frontmatter here")
         assert result["success"] is False
+
+    def test_create_is_visible_in_skills_list(self, tmp_path):
+        with (
+            patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+        ):
+            before = json.loads(skills_list())
+            assert before["skills"] == []
+
+            created = json.loads(
+                skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
+            )
+            assert created["success"] is True
+
+            after = json.loads(skills_list())
+            assert [skill["name"] for skill in after["skills"]] == ["test-skill"]
 
 
 class TestEditSkill:

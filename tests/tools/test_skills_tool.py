@@ -218,6 +218,43 @@ class TestFindAllSkills:
         assert "skill-a" in names
         assert "skill-b" in names
 
+    def test_project_local_skills_hidden_until_approved(self, tmp_path, monkeypatch):
+        user_skills = tmp_path / "user-skills"
+        repo_root = tmp_path / "repo"
+        local_skills = repo_root / ".agents" / "skills"
+        _make_skill(local_skills, "project-only")
+        monkeypatch.setenv("TERMINAL_CWD", str(repo_root))
+
+        with patch("tools.skills_tool.SKILLS_DIR", user_skills):
+            hidden = _find_all_skills()
+            visible = _find_all_skills(
+                allow_project_prompt=True,
+                approval_callback=lambda *_args, **_kwargs: "session",
+            )
+
+        assert hidden == []
+        assert [skill["name"] for skill in visible] == ["project-only"]
+
+    def test_project_local_skill_shadows_user_skill_after_approval(
+        self, tmp_path, monkeypatch
+    ):
+        user_skills = tmp_path / "user-skills"
+        repo_root = tmp_path / "repo"
+        local_skills = repo_root / ".agents" / "skills"
+        _make_skill(user_skills, "shadowed", body="Use the user skill.")
+        _make_skill(local_skills, "shadowed", body="Use the repo skill.")
+        monkeypatch.setenv("TERMINAL_CWD", str(repo_root))
+
+        with patch("tools.skills_tool.SKILLS_DIR", user_skills):
+            skills = _find_all_skills(
+                allow_project_prompt=True,
+                approval_callback=lambda *_args, **_kwargs: "session",
+            )
+
+        assert len(skills) == 1
+        assert skills[0]["name"] == "shadowed"
+        assert skills[0]["scope"] == "project_local"
+
     def test_empty_directory(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             skills = _find_all_skills()
@@ -402,6 +439,21 @@ class TestSkillView:
             raw = skill_view("active-skill")
         result = json.loads(raw)
         assert result["success"] is True
+
+    def test_view_blocks_unapproved_project_local_skill_by_absolute_path(
+        self, tmp_path, monkeypatch
+    ):
+        user_skills = tmp_path / "user-skills"
+        repo_root = tmp_path / "repo"
+        local_skill = _make_skill(repo_root / ".agents" / "skills", "hidden-local")
+        monkeypatch.setenv("TERMINAL_CWD", str(repo_root))
+
+        with patch("tools.skills_tool.SKILLS_DIR", user_skills):
+            raw = skill_view(str(local_skill))
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "not approved" in result["error"].lower()
 
 
 class TestSkillViewSecureSetupOnLoad:
