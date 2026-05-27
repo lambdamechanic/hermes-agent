@@ -20,8 +20,8 @@ Both ``code_execution_tool.py`` and ``tools/environments/local.py`` consult
 from __future__ import annotations
 
 import logging
-from contextvars import ContextVar
-from typing import Iterable
+from contextvars import ContextVar, Token
+from typing import Iterable, Mapping
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # Session-scoped set of env var names that should pass through to sandboxes.
 # Backed by ContextVar to prevent cross-session data bleed in the gateway pipeline.
 _allowed_env_vars_var: ContextVar[set[str]] = ContextVar("_allowed_env_vars")
+_env_overrides_var: ContextVar[dict[str, str]] = ContextVar("_env_overrides")
 
 
 def _get_allowed() -> set[str]:
@@ -39,6 +40,43 @@ def _get_allowed() -> set[str]:
         val: set[str] = set()
         _allowed_env_vars_var.set(val)
         return val
+
+
+def _get_env_overrides_mutable() -> dict[str, str]:
+    """Get or create context-local env values for the current session."""
+    try:
+        return _env_overrides_var.get()
+    except LookupError:
+        val: dict[str, str] = {}
+        _env_overrides_var.set(val)
+        return val
+
+
+def set_env_overrides(values: Mapping[str, object] | None) -> Token[dict[str, str]]:
+    """Install context-local environment values for one agent run.
+
+    The values are not written to ``os.environ``. Tool subprocess builders merge
+    them into child environments only for the current context, and their names
+    are treated as passthrough vars for the same context.
+    """
+    normalized: dict[str, str] = {}
+    if values:
+        for key, value in values.items():
+            name = str(key or "").strip()
+            if not name or value is None:
+                continue
+            normalized[name] = str(value)
+    return _env_overrides_var.set(normalized)
+
+
+def reset_env_overrides(token: Token[dict[str, str]]) -> None:
+    """Restore the previous context-local environment override mapping."""
+    _env_overrides_var.reset(token)
+
+
+def get_env_overrides() -> dict[str, str]:
+    """Return context-local environment values for subprocess builders."""
+    return dict(_get_env_overrides_mutable())
 
 
 # Cache for the config-based allowlist (loaded once per process).
@@ -146,6 +184,8 @@ def is_env_passthrough(var_name: str) -> bool:
     Returns ``True`` if the variable was registered by a skill or listed in
     the user's ``tools.env_passthrough`` config.
     """
+    if var_name in _get_env_overrides_mutable():
+        return True
     if var_name in _get_allowed():
         return True
     return var_name in _load_config_passthrough()
@@ -153,11 +193,13 @@ def is_env_passthrough(var_name: str) -> bool:
 
 def get_all_passthrough() -> frozenset[str]:
     """Return the union of skill-registered and config-based passthrough vars."""
-    return frozenset(_get_allowed()) | _load_config_passthrough()
+    return (
+        frozenset(_get_env_overrides_mutable())
+        | frozenset(_get_allowed())
+        | _load_config_passthrough()
+    )
 
 
 def clear_env_passthrough() -> None:
     """Reset the skill-scoped allowlist (e.g. on session reset)."""
     _get_allowed().clear()
-
-

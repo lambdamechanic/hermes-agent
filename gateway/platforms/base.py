@@ -1199,6 +1199,16 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Per-message agent runtime overrides. Webhook routes use this to pin a
+    # provider/model/base_url for one workload without changing gateway-wide
+    # model config or session-scoped /model state.
+    agent_overrides: Optional[Dict[str, Any]] = None
+
+    # Per-message environment values. Values are exposed to tools through
+    # context-local env passthrough rather than mutating the gateway process
+    # environment for every concurrent session.
+    environment: Optional[Dict[str, str]] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""

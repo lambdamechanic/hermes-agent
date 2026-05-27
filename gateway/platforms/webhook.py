@@ -78,6 +78,16 @@ _LOOPBACK_HOSTS = frozenset({
     "ip6-loopback",
 })
 
+_AGENT_OVERRIDE_FIELDS = frozenset({
+    "model",
+    "provider",
+    "base_url",
+    "api_key",
+    "api_key_env",
+    "key_env",
+    "api_mode",
+})
+
 
 def _is_loopback_host(host: str) -> bool:
     """True when `host` binds only to the local machine.
@@ -90,6 +100,22 @@ def _is_loopback_host(host: str) -> bool:
     if not host:
         return False
     return host.strip().lower() in _LOOPBACK_HOSTS
+
+
+def _coerce_string_map(value: Any) -> Dict[str, str]:
+    """Return a string→string dict, dropping empty keys and non-scalar values."""
+    if not isinstance(value, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key, item in value.items():
+        key_s = str(key or "").strip()
+        if not key_s:
+            continue
+        if item is None:
+            continue
+        if isinstance(item, (str, int, float, bool)):
+            out[key_s] = str(item)
+    return out
 
 
 def check_webhook_requirements() -> bool:
@@ -351,6 +377,29 @@ class WebhookAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[webhook] Failed to reload dynamic routes: %s", e)
 
+    def _agent_overrides_for_route(self, route_config: dict) -> Dict[str, str]:
+        """Extract route-level model/provider fields for this delivery."""
+        overrides: Dict[str, str] = {}
+        for key in _AGENT_OVERRIDE_FIELDS:
+            value = route_config.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+                if value:
+                    overrides[key] = value
+            elif value is not None and isinstance(value, (int, float, bool)):
+                overrides[key] = str(value)
+        return overrides
+
+    def _environment_for_route(self, route_config: dict, payload: dict) -> Dict[str, str]:
+        """Render route-level environment values against the webhook payload."""
+        raw_env = _coerce_string_map(route_config.get("environment", {}))
+        if not raw_env:
+            return {}
+        rendered: Dict[str, str] = {}
+        for key, value in raw_env.items():
+            rendered[key] = self._render_prompt(value, payload, "", "") if value else ""
+        return rendered
+
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         """POST /webhooks/{route_name} — receive and process a webhook event."""
         # Hot-reload dynamic subscriptions on each request (mtime-gated, cheap)
@@ -601,6 +650,8 @@ class WebhookAdapter(BasePlatformAdapter):
             source=source,
             raw_message=payload,
             message_id=delivery_id,
+            agent_overrides=self._agent_overrides_for_route(route_config),
+            environment=self._environment_for_route(route_config, payload),
         )
 
         logger.info(

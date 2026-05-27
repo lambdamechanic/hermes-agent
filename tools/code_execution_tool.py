@@ -138,8 +138,15 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     if is_windows is None:
         is_windows = _IS_WINDOWS
 
+    try:
+        from tools.env_passthrough import get_env_overrides as _get_env_overrides
+    except Exception:
+        _get_env_overrides = lambda: {}  # noqa: E731
+
     scrubbed = {}
-    for k, v in source_env.items():
+    merged_env = dict(source_env)
+    merged_env.update(_get_env_overrides())
+    for k, v in merged_env.items():
         if is_passthrough(k):
             scrubbed[k] = v
             continue

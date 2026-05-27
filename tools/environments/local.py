@@ -183,12 +183,17 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        from tools.env_passthrough import get_env_overrides as _get_env_overrides
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _get_env_overrides = lambda: {}  # noqa: E731
 
     sanitized: dict[str, str] = {}
 
-    for key, value in (base_env or {}).items():
+    merged_base = dict(base_env or {})
+    merged_base.update(_get_env_overrides())
+
+    for key, value in merged_base.items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
         if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
@@ -280,10 +285,13 @@ def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        from tools.env_passthrough import get_env_overrides as _get_env_overrides
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _get_env_overrides = lambda: {}  # noqa: E731
 
     merged = dict(os.environ | env)
+    merged.update(_get_env_overrides())
     run_env = {}
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
