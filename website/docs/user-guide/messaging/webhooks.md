@@ -85,6 +85,11 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
+| `provider` | No | Provider to use for this route's agent run, overriding the gateway default for this webhook delivery only. |
+| `model` | No | Model to use for this route's agent run, overriding the gateway default for this webhook delivery only. |
+| `base_url` | No | Provider base URL override for this route's agent run. |
+| `api_key_env` / `key_env` | No | Env var name to use for this route's provider API key. Values in route `environment` win over process env. |
+| `environment` | No | Per-route environment values exposed to tools for this webhook delivery. Values support `{dot.notation}` templates. Treat values as route-scoped secrets. |
 
 ### Full example
 
@@ -99,6 +104,13 @@ platforms:
         github-pr:
           events: ["pull_request"]
           secret: "github-webhook-secret"
+          provider: "zai"
+          model: "glm-5.1"
+          base_url: "https://api.z.ai/api/coding/paas/v4"
+          api_key_env: "ZAI_API_KEY"
+          environment:
+            ZAI_API_KEY: "zai-route-api-key"
+            GITHUB_TOKEN: "github-token-for-this-route"
           prompt: |
             Review this pull request:
             Repository: {repository.full_name}

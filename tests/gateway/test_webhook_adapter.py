@@ -499,6 +499,54 @@ class TestHTTPHandling:
             assert data["route"] == "test"
 
     @pytest.mark.asyncio
+    async def test_route_agent_overrides_and_environment_attached_to_event(self):
+        """Route model/provider config is carried on the MessageEvent."""
+        routes = {
+            "review": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "PR {number}",
+                "provider": "zai",
+                "model": "glm-5.1",
+                "base_url": "https://api.z.ai/api/coding/paas/v4",
+                "api_key_env": "ZAI_API_KEY",
+                "environment": {
+                    "ZAI_API_KEY": "route-zai-key",
+                    "GITHUB_TOKEN": "gh-{number}",
+                },
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        captured_events = []
+
+        async def _capture(event):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/review",
+                json={"number": 42},
+                headers={"X-GitHub-Delivery": "delivery-review-42"},
+            )
+            assert resp.status == 202
+
+        await asyncio.sleep(0.05)
+        assert len(captured_events) == 1
+        event = captured_events[0]
+        assert event.agent_overrides == {
+            "provider": "zai",
+            "model": "glm-5.1",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key_env": "ZAI_API_KEY",
+        }
+        assert event.environment == {
+            "ZAI_API_KEY": "route-zai-key",
+            "GITHUB_TOKEN": "gh-42",
+        }
+
+    @pytest.mark.asyncio
     async def test_route_without_secret_rejects_unsigned_request(self):
         """Missing HMAC secret must fail closed even if connect() was bypassed."""
         routes = {"test": {"prompt": "hi"}}
@@ -1031,4 +1079,3 @@ class TestInsecureNoAuthSafetyRail:
             assert result is True
         finally:
             await adapter.disconnect()
-

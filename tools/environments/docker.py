@@ -544,18 +544,28 @@ class DockerEnvironment(BaseEnvironment):
 
         explicit_forward_keys = set(self._forward_env)
         passthrough_keys: set[str] = set()
+        env_overrides: dict[str, str] = {}
         try:
-            from tools.env_passthrough import get_all_passthrough
+            from tools.env_passthrough import get_all_passthrough, get_env_overrides
             passthrough_keys = set(get_all_passthrough())
+            env_overrides = get_env_overrides()
         except Exception:
             pass
         # Explicit docker_forward_env entries are an intentional opt-in and must
-        # win over the generic Hermes secret blocklist. Only implicit passthrough
-        # keys are filtered.
-        forward_keys = explicit_forward_keys | (passthrough_keys - _HERMES_PROVIDER_ENV_BLOCKLIST)
+        # win over the generic Hermes secret blocklist. Route-scoped env
+        # overrides are also an explicit operator opt-in for this one run.
+        # Only implicit passthrough keys are filtered.
+        route_env_keys = set(env_overrides)
+        forward_keys = (
+            explicit_forward_keys
+            | route_env_keys
+            | ((passthrough_keys - route_env_keys) - _HERMES_PROVIDER_ENV_BLOCKLIST)
+        )
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
         for key in sorted(forward_keys):
-            value = os.getenv(key)
+            value = env_overrides.get(key)
+            if value is None:
+                value = os.getenv(key)
             if value is None:
                 value = hermes_env.get(key)
             if value is not None:

@@ -1153,6 +1153,88 @@ def _try_resolve_fallback_provider() -> dict | None:
     return None
 
 
+def _runtime_kwargs_from_provider_runtime(runtime: dict) -> dict:
+    """Keep only the AIAgent runtime kwargs used by gateway-created agents."""
+    return {
+        "api_key": runtime.get("api_key"),
+        "base_url": runtime.get("base_url"),
+        "provider": runtime.get("provider"),
+        "api_mode": runtime.get("api_mode"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+        "credential_pool": runtime.get("credential_pool"),
+    }
+
+
+def _normalize_agent_overrides(value: Any) -> dict:
+    """Normalize per-message route overrides into non-empty string values."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key in ("model", "provider", "base_url", "api_key", "api_key_env", "key_env", "api_mode"):
+        raw = value.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text:
+            out[key] = text
+    return out
+
+
+def _normalize_route_environment(value: Any) -> dict[str, str]:
+    """Normalize route-scoped environment values into strings."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, raw in value.items():
+        name = str(key or "").strip()
+        if not name or raw is None:
+            continue
+        out[name] = str(raw)
+    return out
+
+
+def _route_env_lookup(route_env: dict[str, str], name: str) -> str:
+    """Read an env value, preferring route-local values over process env."""
+    key = str(name or "").strip()
+    if not key:
+        return ""
+    value = route_env.get(key)
+    if value:
+        return value
+    return os.getenv(key, "").strip()
+
+
+def _route_api_key_for_provider(
+    overrides: dict,
+    route_env: dict[str, str],
+    provider: str,
+) -> str:
+    """Resolve an explicit API key for route-level provider overrides."""
+    direct = str(overrides.get("api_key") or "").strip()
+    if direct:
+        return direct
+
+    key_env = str(
+        overrides.get("key_env") or overrides.get("api_key_env") or ""
+    ).strip()
+    if key_env:
+        return _route_env_lookup(route_env, key_env)
+
+    if provider:
+        try:
+            from hermes_cli.auth import PROVIDER_REGISTRY
+
+            pconfig = PROVIDER_REGISTRY.get(provider)
+            for env_name in getattr(pconfig, "api_key_env_vars", ()) or ():
+                found = _route_env_lookup(route_env, env_name)
+                if found:
+                    return found
+        except Exception:
+            pass
+    return ""
+
+
 def _build_media_placeholder(event) -> str:
     """Build a text placeholder for media-only events so they aren't dropped.
 
@@ -2344,12 +2426,14 @@ class GatewayRunner:
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        agent_overrides: Optional[dict] = None,
+        environment: Optional[dict] = None,
     ) -> tuple[str, dict]:
-        """Resolve model/runtime for a session, honoring session-scoped /model overrides.
+        """Resolve model/runtime for a session.
 
-        If the session override already contains a complete provider bundle
-        (provider/api_key/base_url/api_mode), prefer it directly instead of
-        resolving fresh global runtime state first.
+        Route-level overrides (used by webhook workloads) are per-message and
+        take precedence over gateway config and session-scoped /model state.
+        Otherwise, honor session-scoped /model overrides as before.
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -2359,6 +2443,69 @@ class GatewayRunner:
                 resolved_session_key = None
 
         model = _resolve_gateway_model(user_config)
+        route_overrides = _normalize_agent_overrides(agent_overrides)
+        route_env = _normalize_route_environment(environment)
+        if route_overrides:
+            override_model = route_overrides.get("model")
+            if override_model:
+                model = override_model
+
+            needs_runtime_resolution = any(
+                route_overrides.get(k)
+                for k in ("provider", "base_url", "api_key", "api_key_env", "key_env", "api_mode")
+            )
+            if needs_runtime_resolution:
+                from hermes_cli.runtime_provider import (
+                    resolve_runtime_provider,
+                    format_runtime_provider_error,
+                )
+                from hermes_cli.auth import AuthError
+
+                requested_provider = route_overrides.get("provider")
+                explicit_api_key = _route_api_key_for_provider(
+                    route_overrides,
+                    route_env,
+                    requested_provider or "",
+                )
+                try:
+                    runtime = resolve_runtime_provider(
+                        requested=requested_provider,
+                        explicit_api_key=explicit_api_key or None,
+                        explicit_base_url=route_overrides.get("base_url"),
+                        target_model=model if override_model else None,
+                    )
+                except AuthError as auth_exc:
+                    raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
+                except Exception as exc:
+                    raise RuntimeError(format_runtime_provider_error(exc)) from exc
+
+                runtime_kwargs = _runtime_kwargs_from_provider_runtime(runtime)
+                if route_overrides.get("api_mode"):
+                    runtime_kwargs["api_mode"] = route_overrides["api_mode"]
+                if not override_model:
+                    runtime_model = runtime.get("model")
+                    if runtime_model:
+                        model = runtime_model
+                    elif runtime_kwargs.get("provider"):
+                        try:
+                            from hermes_cli.models import get_default_model_for_provider
+                            model = get_default_model_for_provider(runtime_kwargs["provider"])
+                        except Exception:
+                            model = ""
+                logger.debug(
+                    "Route agent override: session=%s model=%s provider=%s base_url=%s",
+                    resolved_session_key or "",
+                    model,
+                    runtime_kwargs.get("provider"),
+                    runtime_kwargs.get("base_url"),
+                )
+                return model, runtime_kwargs
+
+            # Model-only route override: keep the normal runtime credentials.
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            runtime_kwargs.pop("model", None)
+            return model, runtime_kwargs
+
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -8191,6 +8338,17 @@ class GatewayRunner:
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        _route_env_token = None
+        try:
+            route_environment = _normalize_route_environment(
+                getattr(event, "environment", None)
+            )
+            if route_environment:
+                from tools.env_passthrough import set_env_overrides
+
+                _route_env_token = set_env_overrides(route_environment)
+        except Exception as exc:
+            logger.warning("Failed to install route environment overrides: %s", exc)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -8715,6 +8873,8 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                agent_overrides=getattr(event, "agent_overrides", None),
+                environment=getattr(event, "environment", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -9146,6 +9306,13 @@ class GatewayRunner:
                 "Try again or use /reset to start a fresh session."
             )
         finally:
+            if _route_env_token is not None:
+                try:
+                    from tools.env_passthrough import reset_env_overrides
+
+                    reset_env_overrides(_route_env_token)
+                except Exception:
+                    pass
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
@@ -15771,6 +15938,8 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        agent_overrides: Optional[dict] = None,
+        environment: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -16485,6 +16654,8 @@ class GatewayRunner:
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
+                    agent_overrides=agent_overrides,
+                    environment=environment,
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
@@ -17808,6 +17979,8 @@ class GatewayRunner:
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_agent_overrides = agent_overrides
+                next_environment = environment
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -17825,6 +17998,8 @@ class GatewayRunner:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
+                    next_agent_overrides = getattr(pending_event, "agent_overrides", None)
+                    next_environment = getattr(pending_event, "environment", None)
 
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
@@ -17850,6 +18025,8 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    agent_overrides=next_agent_overrides,
+                    environment=next_environment,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
